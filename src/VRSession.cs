@@ -207,6 +207,10 @@ namespace OlliVR
         }
 
         public static void SetOverlayTexture(IntPtr tex) => overlayTex = tex;
+        public static void SetScreenTexture(IntPtr tex) => screenTex = tex;
+        public static ulong ScreenHandle;
+        static volatile IntPtr screenTex;
+        public const int EventSubmitScreen = 3;
 
         [UnmanagedCallersOnly]
         static void OnRenderEvent(int id)
@@ -228,6 +232,12 @@ namespace OlliVR
                     Trace("render thread: right submitted");
                     Compositor.PostPresentHandoff();
                     Trace("render thread: handoff done");
+                }
+                else if (id == EventSubmitScreen)
+                {
+                    if (screenTex == IntPtr.Zero || ScreenHandle == 0 || Overlay == null) return;
+                    var t = new Texture_t { handle = screenTex, eType = ETextureType.DirectX, eColorSpace = EColorSpace.Auto };
+                    Overlay.SetOverlayTexture(ScreenHandle, ref t);
                 }
                 else if (id == EventSubmitOverlay)
                 {

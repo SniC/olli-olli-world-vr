@@ -34,6 +34,7 @@ namespace OlliVR
         UIOverlay ui;
         float nextSceneFixup;
         readonly List<Camera> stereoCams = new();
+        readonly List<Camera> flatCams = new();
         readonly HashSet<string> loggedCams = new();
         string[] disabledEffects = Array.Empty<string>();
 
@@ -225,6 +226,16 @@ namespace OlliVR
             var headPos = Plugin.Cfg.PositionalTracking.Value ? inv * (hmdPos - originPos) : Vector3.zero;
 
             CollectCameras();
+            if (ui != null)
+            {
+                bool showScreen = flatCams.Count > 0;
+                if (showScreen)
+                {
+                    RenderFlat();
+                    GL.IssuePluginEvent(VRSession.RenderEventFunc, VRSession.EventSubmitScreen);
+                }
+                ui.SetScreenVisible(showScreen);
+            }
             if (stereoCams.Count == 0)
             {
                 // Menu / title screens have no 3D camera: show a dark backdrop behind the UI panel.
@@ -232,6 +243,7 @@ namespace OlliVR
                 RenderTexture.active = leftRT; GL.Clear(true, true, new Color(0.08f, 0.08f, 0.1f, 1f));
                 RenderTexture.active = rightRT; GL.Clear(true, true, new Color(0.08f, 0.08f, 0.1f, 1f));
                 RenderTexture.active = prev;
+                if (captureRequested) { captureRequested = false; Capture(hmdPos, hmdRot, headPos, headRot); }
                 ui?.UpdatePlacement(originPos, originRot);
                 GL.IssuePluginEvent(VRSession.RenderEventFunc, VRSession.PrepareSubmit());
                 if (ui != null) GL.IssuePluginEvent(VRSession.RenderEventFunc, VRSession.EventSubmitOverlay);
@@ -268,6 +280,8 @@ namespace OlliVR
                 var dir = BepInEx.Paths.BepInExRootPath;
                 SaveRT(leftRT, System.IO.Path.Combine(dir, "OlliVR_capture_L.png"));
                 SaveRT(rightRT, System.IO.Path.Combine(dir, "OlliVR_capture_R.png"));
+                if (ui != null) SaveRT(ui.Texture, System.IO.Path.Combine(dir, "OlliVR_capture_UI.png"));
+                if (ui?.ScreenTexture != null && flatCams.Count > 0) SaveRT(ui.ScreenTexture, System.IO.Path.Combine(dir, "OlliVR_capture_Screen.png"));
                 var sb = new System.Text.StringBuilder();
                 sb.AppendLine($"Capture: hmdPos={hmdPos.ToString("F3")} hmdRot={hmdRot.eulerAngles.ToString("F1")} " +
                               $"headPos={headPos.ToString("F3")} headRot={headRot.eulerAngles.ToString("F1")} origin={originPos.ToString("F3")}/{originRot.eulerAngles.ToString("F1")}");
@@ -426,6 +440,7 @@ namespace OlliVR
         void CollectCameras()
         {
             stereoCams.Clear();
+            flatCams.Clear();
             if (renderedFrame != Time.frameCount) return;
             for (int i = 0; i < renderedThisFrame.Count; i++)
             {
@@ -434,13 +449,44 @@ namespace OlliVR
                 if (c.targetTexture != null) continue;              // off-screen / our own UI cam
                 if (ui != null && c == ui.Camera) continue;
                 if ((c.cullingMask & ~uiLayerMask) == 0) continue;  // pure UI camera
-                stereoCams.Add(c);
+                // Orthographic views (world map) have no depth to show; they go on the flat virtual screen.
+                bool flat = c.orthographic && ui != null && ui.ScreenTexture != null;
+                (flat ? flatCams : stereoCams).Add(c);
 
                 if (loggedCams.Add(c.name))
-                    Plugin.L.LogInfo($"Stereo camera '{c.name}': depth={c.depth} ortho={c.orthographic} fov={c.fieldOfView:0.#} " +
+                    Plugin.L.LogInfo($"{(flat ? "Flat" : "Stereo")} camera '{c.name}': depth={c.depth} ortho={c.orthographic} fov={c.fieldOfView:0.#} " +
                                      $"near={c.nearClipPlane} far={c.farClipPlane} mask=0x{c.cullingMask:X} clear={c.clearFlags} pos={c.transform.position}");
             }
             stereoCams.Sort((a, b) => a.depth.CompareTo(b.depth));
+            flatCams.Sort((a, b) => a.depth.CompareTo(b.depth));
+        }
+
+        /// <summary>Renders orthographic cameras unchanged (own projection, no head tracking) to the virtual screen.</summary>
+        void RenderFlat()
+        {
+            var rt = ui.ScreenTexture;
+            insideVRRender = true;
+            try
+            {
+                for (int i = 0; i < flatCams.Count; i++)
+                {
+                    var cam = flatCams[i];
+                    var saved = cam.targetTexture;
+                    try
+                    {
+                        cam.targetTexture = rt;
+                        if (i == 0 && cam.clearFlags == CameraClearFlags.Nothing)
+                        {
+                            var prev = RenderTexture.active;
+                            RenderTexture.active = rt; GL.Clear(true, true, Color.black);
+                            RenderTexture.active = prev;
+                        }
+                        cam.Render();
+                    }
+                    finally { cam.targetTexture = saved; }
+                }
+            }
+            finally { insideVRRender = false; }
         }
 
         void RenderEye(EVREye eye, RenderTexture rt, Vector3 headPos, Quaternion headRot)

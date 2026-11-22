@@ -60,9 +60,30 @@ namespace OlliVR
                 var bounds = new VRTextureBounds_t { uMin = 0, uMax = 1, vMin = flip ? 1 : 0, vMax = flip ? 0 : 1 };
                 ov.SetOverlayTextureBounds(handle, ref bounds);
                 ov.SetOverlayFlag(handle, VROverlayFlags.IsPremultiplied, false);
+                ov.SetOverlaySortOrder(handle, 1);
                 ov.ShowOverlay(handle);
 
                 VRSession.SetOverlayTexture(rt.GetNativeTexturePtr());
+
+                // "Virtual screen" behind the UI for flat (orthographic) game views such as the world map.
+                ScreenTexture = new RenderTexture(Width, Height, 24, RenderTextureFormat.ARGB32, RenderTextureReadWrite.Default)
+                {
+                    name = "OlliVR_Screen",
+                    hideFlags = HideFlags.HideAndDontSave,
+                };
+                ScreenTexture.Create();
+                UnityEngine.Object.DontDestroyOnLoad(ScreenTexture);
+                ulong sh = 0;
+                err = ov.CreateOverlay("olliolliworld.vr.screen", "OlliOlli World Screen", ref sh);
+                if (err == EVROverlayError.None)
+                {
+                    VRSession.ScreenHandle = sh;
+                    ov.SetOverlayWidthInMeters(sh, Plugin.Cfg.UIWidth.Value);
+                    ov.SetOverlayTextureBounds(sh, ref bounds);
+                    ov.SetOverlaySortOrder(sh, 0);
+                    VRSession.SetScreenTexture(ScreenTexture.GetNativeTexturePtr());
+                }
+                else Plugin.L.LogWarning("CreateOverlay (screen) failed: " + err);
                 Plugin.L.LogInfo("UI overlay created.");
                 return true;
             }
@@ -83,9 +104,7 @@ namespace OlliVR
                     var c = o.Cast<Canvas>();
                     if (c == null || !c.isRootCanvas) continue;
 
-                    bool needs = c.renderMode == RenderMode.ScreenSpaceOverlay ||
-                                 (c.renderMode == RenderMode.ScreenSpaceCamera && c.worldCamera != Camera);
-                    if (!needs) continue;
+                    if (!ShouldConvert(c)) continue;
 
                     c.renderMode = RenderMode.ScreenSpaceCamera;
                     c.worldCamera = Camera;
@@ -102,6 +121,34 @@ namespace OlliVR
             }
         }
 
+        /// <summary>
+        /// Overlay canvases always move to the panel. Screen-space-camera canvases move only if they were drawn
+        /// by a UI-only camera (like the game's own "UI Camera"). Canvases attached to a 3D scene camera (for
+        /// example the front end's "World Space Back/Front" backdrops) stay in the stereo scene.
+        /// </summary>
+        bool ShouldConvert(Canvas c)
+        {
+            if (c.renderMode == RenderMode.ScreenSpaceOverlay) return true;
+            if (c.renderMode != RenderMode.ScreenSpaceCamera) return false;
+            var wc = c.worldCamera;
+            if (wc == null) return true;            // behaves like an overlay
+            if (wc == Camera) return false;         // already ours
+            return (wc.cullingMask & ~(1 << 5)) == 0; // UI-only camera
+        }
+
+        public RenderTexture Texture => rt;
+        public RenderTexture ScreenTexture { get; private set; }
+        bool screenVisible;
+
+        public void SetScreenVisible(bool visible)
+        {
+            if (visible == screenVisible || VRSession.ScreenHandle == 0) return;
+            screenVisible = visible;
+            if (visible) VRSession.Overlay.ShowOverlay(VRSession.ScreenHandle);
+            else VRSession.Overlay.HideOverlay(VRSession.ScreenHandle);
+            Plugin.L.LogInfo(visible ? "Flat view -> virtual screen" : "Virtual screen hidden");
+        }
+
         /// <summary>Places the panel straight ahead of the recentered origin (in seated tracking space).</summary>
         public void UpdatePlacement(Vector3 originPos, Quaternion originRot)
         {
@@ -111,6 +158,8 @@ namespace OlliVR
             var pos = originPos + originRot * new Vector3(0, Plugin.Cfg.UIHeightOffset.Value, Plugin.Cfg.UIDistance.Value);
             var m = VRSession.ToOpenVR(pos, originRot);
             VRSession.Overlay.SetOverlayTransformAbsolute(VRSession.OverlayHandle, VRSession.Universe, ref m);
+            if (VRSession.ScreenHandle != 0)
+                VRSession.Overlay.SetOverlayTransformAbsolute(VRSession.ScreenHandle, VRSession.Universe, ref m);
         }
     }
 }
