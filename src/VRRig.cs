@@ -312,26 +312,21 @@ namespace OlliVR
         }
 
         /// <summary>The game's projection for a camera this frame (captured before any eye render).</summary>
-        struct GameProjection { public Matrix4x4 Matrix; public bool Custom; public int Frame; }
+        struct GameProjection { public Matrix4x4 Matrix; public int Frame; }
         readonly Dictionary<IntPtr, GameProjection> gameProjections = new();
 
+        /// <summary>
+        /// Unity's automatic projection for the camera (includes any physical-camera lens shift Cinemachine
+        /// applies). The game never sets a custom projection matrix, so it is always reset, never written back:
+        /// writing a matrix back would freeze the camera on it.
+        /// </summary>
         GameProjection OriginalProjection(Camera cam)
         {
             if (gameProjections.TryGetValue(cam.Pointer, out var p) && p.Frame == Time.frameCount) return p;
-            var m = cam.projectionMatrix;
-            // The game sets an off-centre projection itself during gameplay; detect whether this is a custom
-            // matrix (must be put back as-is) or Unity's automatic one (put back with ResetProjectionMatrix).
-            bool custom = !cam.orthographic && !Approximately(m,
-                Matrix4x4.Perspective(cam.fieldOfView, cam.aspect, cam.nearClipPlane, cam.farClipPlane));
-            p = new GameProjection { Matrix = m, Custom = custom, Frame = Time.frameCount };
+            cam.ResetProjectionMatrix();
+            p = new GameProjection { Matrix = cam.projectionMatrix, Frame = Time.frameCount };
             gameProjections[cam.Pointer] = p;
             return p;
-        }
-
-        static bool Approximately(Matrix4x4 a, Matrix4x4 b)
-        {
-            for (int i = 0; i < 16; i++) if (Mathf.Abs(a[i] - b[i]) > 1e-3f) return false;
-            return true;
         }
 
         /// <summary>Renders a game camera into an eye texture from <paramref name="eye"/>, then restores it.</summary>
@@ -356,8 +351,7 @@ namespace OlliVR
             finally
             {
                 cam.targetTexture = savedTarget;
-                if (original.Custom) cam.projectionMatrix = original.Matrix;
-                else cam.ResetProjectionMatrix();
+                cam.ResetProjectionMatrix();
                 tr.SetPositionAndRotation(savedPos, savedRot);
             }
         }
@@ -380,6 +374,16 @@ namespace OlliVR
             float halfH = gp.m11 != 0f ? 1f / gp.m11 : Mathf.Tan(cam.fieldOfView * 0.5f * Mathf.Deg2Rad);
             float cx = gp.m00 != 0f ? gp.m02 / gp.m00 : 0f;
             float cy = gp.m11 != 0f ? gp.m12 / gp.m11 : 0f;
+            // Cinemachine frames the skater off-centre with Camera.lensShift. The game renders with it even
+            // though the camera isn't in physical mode, but Camera.projectionMatrix doesn't include it then,
+            // so apply it here: the shift is a fraction of the frame width/height.
+            if (!cam.usePhysicalProperties)
+            {
+                var ls = cam.lensShift;
+                float halfW = gp.m00 != 0f ? 1f / gp.m00 : halfH * cam.aspect;
+                cx += ls.x * 2f * halfW;
+                cy += ls.y * 2f * halfH;
+            }
 
             // Game units per real metre: the screen height covers the game frame height at distance d.
             float s = 2f * d * halfH / h;
@@ -455,26 +459,55 @@ namespace OlliVR
         void UpdateConvergence(Camera cam)
         {
             float d = Plugin.Cfg.ConvergenceDistance.Value;
-            float cmDist = 0, rayDist = 0;
+            float skaterDist = 0, rayDist = 0;
             if (d <= 0f)
             {
-                // The Cinemachine target is not always the subject (e.g. level intro screens), so also
-                // raycast down the view centre and use whichever is nearer.
-                cmDist = GetCinemachineFocusDistance(cam);
-                rayDist = GetRaycastFocusDistance(cam);
-                if (cmDist > 0 && rayDist > 0) d = Mathf.Min(cmDist, rayDist);
-                else d = Mathf.Max(cmDist, rayDist);
-                if (d <= 0f) d = convergence > 0 ? convergence : 15f;
-                // Smooth so cuts and passing foreground objects don't make the depth pump.
-                convergence = convergence <= 0 ? d : Mathf.Lerp(convergence, d, 1f - Mathf.Exp(-Time.unscaledDeltaTime * 1.5f));
+                // Put the skater on the screen surface: stable, and the thing you look at. The raycast down the
+                // view centre (which jumps between foreground and background) is only a fallback for scenes
+                // without the skater.
+                skaterDist = GetSkaterDistance(cam);
+                if (skaterDist > cam.nearClipPlane) d = skaterDist;
+                else
+                {
+                    rayDist = GetRaycastFocusDistance(cam);
+                    d = rayDist > 0f ? rayDist : (convergence > 0 ? convergence : 15f);
+                }
+                // Smooth so cuts don't make the depth pump.
+                convergence = convergence <= 0 ? d : Mathf.Lerp(convergence, d, 1f - Mathf.Exp(-Time.unscaledDeltaTime * 1f));
             }
             else convergence = d;
 
             if (Plugin.Cfg.VerboseLogging.Value && Time.unscaledTime >= nextConvergenceLog)
             {
                 nextConvergenceLog = Time.unscaledTime + 10f;
-                Plugin.L.LogInfo($"Convergence: cinemachine {cmDist:0.0}, raycast {rayDist:0.0} -> {convergence:0.0} (game fov {cam.fieldOfView:0.0})");
+                Plugin.L.LogInfo($"Convergence: skater {skaterDist:0.0}, raycast {rayDist:0.0} -> {convergence:0.0} (game fov {cam.fieldOfView:0.0})");
             }
+        }
+
+        Transform skater;
+        float nextSkaterSearch;
+
+        /// <summary>Depth of the player's skater in front of <paramref name="cam"/>, or 0 if not found.</summary>
+        float GetSkaterDistance(Camera cam)
+        {
+            try
+            {
+                if (skater == null && Time.unscaledTime >= nextSkaterSearch)
+                {
+                    nextSkaterSearch = Time.unscaledTime + 2f;
+                    var root = GameObject.Find("Local Player Controller");
+                    var s = root != null ? root.transform.Find("Skater - Local") : null;
+                    skater = s != null ? s : (root != null ? root.transform : null);
+                }
+                if (skater == null || !skater.gameObject.activeInHierarchy) return 0f;
+                var t = cam.transform;
+                float dist = Vector3.Dot(skater.position - t.position, t.forward);
+                // Only meaningful when the skater is actually in view.
+                var vp = cam.WorldToViewportPoint(skater.position);
+                if (vp.z <= 0f || vp.x < -0.1f || vp.x > 1.1f || vp.y < -0.1f || vp.y > 1.1f) return 0f;
+                return dist;
+            }
+            catch { skater = null; return 0f; }
         }
 
         static float GetRaycastFocusDistance(Camera cam)
