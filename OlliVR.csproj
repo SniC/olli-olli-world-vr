@@ -28,10 +28,14 @@
     <Reference Include="$(BepInExDir)\interop\UnityEngine.dll" Private="false" />
     <Reference Include="$(BepInExDir)\interop\UnityEngine.CoreModule.dll" Private="false" />
     <Reference Include="$(BepInExDir)\interop\UnityEngine.UIModule.dll" Private="false" />
+    <Reference Include="$(BepInExDir)\interop\UnityEngine.UI.dll" Private="false" />
+    <Reference Include="$(BepInExDir)\interop\Unity.TextMeshPro.dll" Private="false" />
     <Reference Include="$(BepInExDir)\interop\UnityEngine.PhysicsModule.dll" Private="false" />
     <Reference Include="$(BepInExDir)\interop\UnityEngine.ImageConversionModule.dll" Private="false" />
+    <Reference Include="$(BepInExDir)\interop\UnityEngine.ScreenCaptureModule.dll" Private="false" />
     <Reference Include="$(BepInExDir)\interop\Unity.InputSystem.dll" Private="false" />
     <Reference Include="$(BepInExDir)\interop\Cinemachine.dll" Private="false" />
+    <Reference Include="$(BepInExDir)\interop\Assembly-CSharp.dll" Private="false" />    <Reference Include="$(BepInExDir)\core\0Harmony.dll" Private="false" />
     <Reference Include="$(BepInExDir)\interop\Unity.Postprocessing.Runtime.dll" Private="false" />
   </ItemGroup>
 

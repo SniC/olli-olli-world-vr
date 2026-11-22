@@ -12,18 +12,23 @@ using Valve.VR;
 namespace OlliVR
 {
     /// <summary>
-    /// Drives stereo rendering: each frame, after the game (and Cinemachine) has positioned its cameras,
-    /// every on-screen game camera is re-rendered once per eye into per-eye RenderTextures, with the
-    /// HMD pose applied relative to the game camera, and the result is submitted to SteamVR.
+    /// Stereoscopic virtual screen with head-coupled ("fish tank") perspective.
+    ///
+    /// Each frame, after the game has rendered its own cameras, every camera it rendered to the monitor is
+    /// rendered again twice into a side-by-side texture shown on a floating SteamVR overlay screen. Each half
+    /// uses an off-axis projection from that eye's real position through the screen rectangle, so the screen
+    /// behaves like a window into the game world: correct stereo depth, plus parallax when you move your head.
+    /// From the nominal viewing position the image matches the game's own framing exactly.
     /// </summary>
     public class VRRig : MonoBehaviour
     {
         public VRRig(IntPtr ptr) : base(ptr) { }
 
-        RenderTexture leftRT, rightRT;
-        bool initialized, failed, tracedFirstCameraFrame, captureRequested;
+        ScreenOverlays screen;
+        RenderTexture backdropL, backdropR;
+        bool initialized, failed, captureRequested;
         float nextInitAttempt;
-        int uiLayerMask = 1 << 5;
+        const int UILayerMask = 1 << 5;
 
         // Recenter origin in tracking space (yaw only + position).
         Vector3 originPos;
@@ -31,10 +36,12 @@ namespace OlliVR
         bool haveOrigin;
         float stickHoldTime;
 
-        UIOverlay ui;
-        float nextSceneFixup;
-        readonly List<Camera> stereoCams = new();
-        readonly List<Camera> flatCams = new();
+        Vector3 eyeOffsetL, eyeOffsetR;
+        float lastFov = 33.4f;
+        float convergence;          // smoothed, game units
+        float nextSceneFixup, nextDump, nextConvergenceLog;
+        readonly List<Camera> screenCams = new();
+        readonly List<Camera> gameUICams = new();
         readonly HashSet<string> loggedCams = new();
         string[] disabledEffects = Array.Empty<string>();
 
@@ -51,7 +58,6 @@ namespace OlliVR
         {
             Plugin.L.LogInfo($"Scene loaded: {s.name}");
             loggedCams.Clear();
-            dumpCameras = true;
             nextSceneFixup = 0; // re-apply fixups right away
         }
 
@@ -63,40 +69,34 @@ namespace OlliVR
             nextInitAttempt = Time.unscaledTime + 5f;
             if (!VRSession.Init(logFailure: !failed)) { failed = true; return false; }
             if (failed) Plugin.L.LogInfo("OpenVR connected after retry.");
-
-            int w = Mathf.Max(256, (int)(VRSession.EyeWidth * Plugin.Cfg.RenderScale.Value));
-            int h = Mathf.Max(256, (int)(VRSession.EyeHeight * Plugin.Cfg.RenderScale.Value));
-            leftRT = MakeEyeRT(w, h, "OlliVR_Left");
-            rightRT = MakeEyeRT(w, h, "OlliVR_Right");
-            VRSession.SetEyeTextures(leftRT.GetNativeTexturePtr(), rightRT.GetNativeTexturePtr(), Plugin.Cfg.FlipVertical.Value);
-            Plugin.L.LogInfo($"Eye RTs {w}x{h}, colour space {QualitySettings.activeColorSpace}");
-
-            // Exercise the per-eye OpenVR queries once at startup (also useful diagnostics).
-            VRSession.GetEye(EVREye.Eye_Left, 0.1f, 1000f, out _, out _, out var pl);
-            VRSession.GetEye(EVREye.Eye_Right, 0.1f, 1000f, out _, out _, out _);
-            Plugin.L.LogInfo("Eye queries OK. Left projection:\n" + pl);
             VRSession.TraceBudget = 0;
 
-            if (Plugin.Cfg.UIOverlay.Value)
-            {
-                ui = new UIOverlay();
-                if (!ui.Init()) ui = null;
-            }
+            // The scene layer is just a dark room behind the screen; small textures cleared once.
+            backdropL = MakeBackdrop("OlliVR_BackdropL");
+            backdropR = MakeBackdrop("OlliVR_BackdropR");
+            VRSession.SetEyeTextures(backdropL.GetNativeTexturePtr(), backdropR.GetNativeTexturePtr(), Plugin.Cfg.FlipVertical.Value);
+
+            eyeOffsetL = VRSession.GetEyeOffset(EVREye.Eye_Left);
+            eyeOffsetR = VRSession.GetEyeOffset(EVREye.Eye_Right);
+            Plugin.L.LogInfo($"IPD {(eyeOffsetR - eyeOffsetL).magnitude * 1000f:0.0} mm");
+
+            float aspect = Screen.height > 0 ? (float)Screen.width / Screen.height : 16f / 9f;
+            screen = new ScreenOverlays();
+            if (!screen.Init(aspect)) { failed = true; VRSession.Shutdown(); return false; }
+
             initialized = true;
             return true;
         }
 
-        static RenderTexture MakeEyeRT(int w, int h, string name)
+        static RenderTexture MakeBackdrop(string name)
         {
-            var rw = QualitySettings.activeColorSpace == ColorSpace.Linear ? RenderTextureReadWrite.sRGB : RenderTextureReadWrite.Default;
-            var rt = new RenderTexture(w, h, 24, RenderTextureFormat.ARGB32, rw)
-            {
-                name = name,
-                antiAliasing = 1,
-                hideFlags = HideFlags.HideAndDontSave,
-            };
+            var rt = new RenderTexture(256, 256, 0, RenderTextureFormat.ARGB32) { name = name, hideFlags = HideFlags.HideAndDontSave };
             rt.Create();
             UnityEngine.Object.DontDestroyOnLoad(rt);
+            var prev = RenderTexture.active;
+            RenderTexture.active = rt;
+            GL.Clear(true, true, new Color(0.035f, 0.035f, 0.045f, 1f));
+            RenderTexture.active = prev;
             return rt;
         }
 
@@ -105,6 +105,7 @@ namespace OlliVR
             if (!EnsureInit()) return;
 
             VRSession.PollEvents();
+            if (VRSession.RecenterRequested) { VRSession.RecenterRequested = false; haveOrigin = false; }
             HandleRecenterInput();
 
             if (Time.unscaledTime >= nextSceneFixup)
@@ -114,8 +115,9 @@ namespace OlliVR
                 var trigger = System.IO.Path.Combine(BepInEx.Paths.BepInExRootPath, "OlliVR_capture.trigger");
                 if (System.IO.File.Exists(trigger)) { System.IO.File.Delete(trigger); captureRequested = true; }
                 ApplySceneFixups();
-                ui?.ScanCanvases();
+                screen.ScanCanvases();
             }
+
         }
 
         void HandleRecenterInput()
@@ -206,125 +208,253 @@ namespace OlliVR
             }
         }
 
+        // ---- Per-frame ------------------------------------------------------------------------------
+
+        /// <summary>
+        /// Runs at end of frame, after the game rendered its own frame (Cinemachine has placed the cameras).
+        ///
+        /// Important property of the game's render pipeline (Roll7.NoComplyRenderer): a camera render does not
+        /// draw on top of what is in its target, it renders into internal textures and then replaces the whole
+        /// target. So nothing may be rendered "on top" of an eye image afterwards. The game's screen-space UI is
+        /// therefore attached to the game's main camera (see ScreenOverlays.ScanCanvases) and drawn as part of
+        /// each eye render, at the convergence distance so it sits on the screen surface.
+        /// </summary>
         void RenderAndSubmit()
         {
             if (!VRSession.GetPredictedHmdPose(out var hmdPos, out var hmdRot)) return;
 
             if (!haveOrigin)
             {
-                // Yaw-only origin so the horizon stays level.
+                // Yaw-only origin so the screen stands upright.
                 var fwd = hmdRot * Vector3.forward;
                 fwd.y = 0;
                 originRot = fwd.sqrMagnitude > 1e-6f ? Quaternion.LookRotation(fwd.normalized, Vector3.up) : Quaternion.identity;
                 originPos = hmdPos;
                 haveOrigin = true;
-                Plugin.L.LogInfo("View recentered.");
+                Plugin.L.LogInfo("Screen recentered.");
             }
-
-            var inv = Quaternion.Inverse(originRot);
-            var headRot = inv * hmdRot;
-            var headPos = Plugin.Cfg.PositionalTracking.Value ? inv * (hmdPos - originPos) : Vector3.zero;
 
             CollectCameras();
-            if (ui != null)
-            {
-                bool showScreen = flatCams.Count > 0;
-                if (showScreen)
-                {
-                    RenderFlat();
-                    GL.IssuePluginEvent(VRSession.RenderEventFunc, VRSession.EventSubmitScreen);
-                }
-                ui.SetScreenVisible(showScreen);
-            }
-            if (stereoCams.Count == 0)
-            {
-                // Menu / title screens have no 3D camera: show a dark backdrop behind the UI panel.
-                var prev = RenderTexture.active;
-                RenderTexture.active = leftRT; GL.Clear(true, true, new Color(0.08f, 0.08f, 0.1f, 1f));
-                RenderTexture.active = rightRT; GL.Clear(true, true, new Color(0.08f, 0.08f, 0.1f, 1f));
-                RenderTexture.active = prev;
-                if (captureRequested) { captureRequested = false; Capture(hmdPos, hmdRot, headPos, headRot); }
-                ui?.UpdatePlacement(originPos, originRot);
-                GL.IssuePluginEvent(VRSession.RenderEventFunc, VRSession.PrepareSubmit());
-                if (ui != null) GL.IssuePluginEvent(VRSession.RenderEventFunc, VRSession.EventSubmitOverlay);
-                return;
-            }
+            if (screen.EyeLeft.width != Screen.width || screen.EyeLeft.height != Screen.height)
+                screen.Resize(Screen.width, Screen.height);
 
-            if (!tracedFirstCameraFrame) { tracedFirstCameraFrame = true; if (Plugin.Cfg.VerboseLogging.Value) VRSession.TraceBudget = 30; }
-            UpdateFraming(stereoCams[stereoCams.Count - 1]);
+            // Screen size follows the game's (perspective) field of view so the default view matches the game.
+            Camera perspCam = null;
+            for (int i = screenCams.Count - 1; i >= 0; i--)
+                if (!screenCams[i].orthographic) { perspCam = screenCams[i]; break; }
+            if (perspCam != null)
+            {
+                // The game zooms and shifts with its own projection matrix, so use the field of view it actually
+                // shows (not Camera.fieldOfView). Captured before any eye render this frame.
+                var gp = OriginalProjection(perspCam).Matrix;
+                lastFov = gp.m11 > 0f ? 2f * Mathf.Atan(1f / gp.m11) * Mathf.Rad2Deg : perspCam.fieldOfView;
+            }
+            float aspect = (float)screen.EyeWidth / screen.EyeHeight;
+            screen.Place(originPos, originRot, lastFov, aspect);
+
+            // The camera that carries the game's screen-space UI: the top-most scene camera.
+            Camera uiHost = screenCams.Count > 0 ? screenCams[screenCams.Count - 1] : null;
+            if (perspCam != null) UpdateConvergence(perspCam);
+            screen.BindUI(uiHost, convergence > 0f ? convergence : 15f);
+
             insideVRRender = true;
             try
             {
-                RenderEye(EVREye.Eye_Left, leftRT, headPos, headRot);
-                RenderEye(EVREye.Eye_Right, rightRT, headPos, headRot);
+                if (screenCams.Count > 0)
+                {
+                    // Eye positions in screen space (metres; x right, y up, z towards the screen).
+                    var eyeL = EyeInScreenSpace(hmdPos, hmdRot, eyeOffsetL);
+                    var eyeR = EyeInScreenSpace(hmdPos, hmdRot, eyeOffsetR);
+                    RenderEyeImage(screen.EyeLeft, eyeL);
+                    RenderEyeImage(screen.EyeRight, eyeR);
+                }
+                else
+                {
+                    // UI-only screens (title, loading): black behind the UI.
+                    var prevActive = RenderTexture.active;
+                    RenderTexture.active = screen.EyeLeft; GL.Clear(true, true, Color.black);
+                    RenderTexture.active = screen.EyeRight; GL.Clear(true, true, Color.black);
+                    RenderTexture.active = prevActive;
+                }
+
+                // The game's screen-space UI over each eye image (identical in both, so it sits on the screen
+                // surface). The eye image becomes the UI camera's background; see ScreenOverlays.CompositeUIOnto.
+                ForceOpaque(screen.EyeLeft);
+                ForceOpaque(screen.EyeRight);
+                screen.CompositeUIOnto(screen.EyeLeft);
+                screen.CompositeUIOnto(screen.EyeRight);
             }
             finally { insideVRRender = false; }
 
-            if (captureRequested)
-            {
-                captureRequested = false;
-                Capture(hmdPos, hmdRot, headPos, headRot);
-            }
+            int ew = screen.EyeWidth, eh = screen.EyeHeight;
+            Graphics.CopyTexture(screen.EyeLeft, 0, 0, 0, 0, ew, eh, screen.StereoTexture, 0, 0, 0, 0);
+            Graphics.CopyTexture(screen.EyeRight, 0, 0, 0, 0, ew, eh, screen.StereoTexture, 0, 0, ew, 0);
+            ForceOpaque(screen.StereoTexture);
+            GL.IssuePluginEvent(VRSession.RenderEventFunc, VRSession.EventSubmitScreen);
 
-            ui?.UpdatePlacement(originPos, originRot);
-            VRSession.Trace($"IssuePluginEvent fn=0x{VRSession.RenderEventFunc.ToInt64():X}");
+            if (captureRequested) { captureRequested = false; Capture(hmdPos, hmdRot); }
+
+            // Backdrop eye frames keep SteamVR's scene layer (and frame pacing) going behind the screen.
             GL.IssuePluginEvent(VRSession.RenderEventFunc, VRSession.PrepareSubmit());
-            VRSession.Trace("IssuePluginEvent returned");
-            if (ui != null) GL.IssuePluginEvent(VRSession.RenderEventFunc, VRSession.EventSubmitOverlay);
         }
 
-        void Capture(Vector3 hmdPos, Quaternion hmdRot, Vector3 headPos, Quaternion headRot)
+        /// <summary>
+        /// One eye: the game's scene cameras in depth order, then its world-space UI camera(s), the same sequence
+        /// the game renders to the monitor (each later camera takes over from the earlier one the way the game
+        /// relies on).
+        /// </summary>
+        void RenderEyeImage(RenderTexture rt, Vector3 eye)
         {
+            for (int i = 0; i < screenCams.Count; i++)
+                RenderEye(screenCams[i], rt, eye, OriginalProjection(screenCams[i]));
+            for (int i = 0; i < gameUICams.Count; i++)
+                RenderOnTop(gameUICams[i], rt);
+        }
+
+        /// <summary>The game's projection for a camera this frame (captured before any eye render).</summary>
+        struct GameProjection { public Matrix4x4 Matrix; public bool Custom; public int Frame; }
+        readonly Dictionary<IntPtr, GameProjection> gameProjections = new();
+
+        GameProjection OriginalProjection(Camera cam)
+        {
+            if (gameProjections.TryGetValue(cam.Pointer, out var p) && p.Frame == Time.frameCount) return p;
+            var m = cam.projectionMatrix;
+            // The game sets an off-centre projection itself during gameplay; detect whether this is a custom
+            // matrix (must be put back as-is) or Unity's automatic one (put back with ResetProjectionMatrix).
+            bool custom = !cam.orthographic && !Approximately(m,
+                Matrix4x4.Perspective(cam.fieldOfView, cam.aspect, cam.nearClipPlane, cam.farClipPlane));
+            p = new GameProjection { Matrix = m, Custom = custom, Frame = Time.frameCount };
+            gameProjections[cam.Pointer] = p;
+            return p;
+        }
+
+        static bool Approximately(Matrix4x4 a, Matrix4x4 b)
+        {
+            for (int i = 0; i < 16; i++) if (Mathf.Abs(a[i] - b[i]) > 1e-3f) return false;
+            return true;
+        }
+
+        /// <summary>Renders a game camera into an eye texture from <paramref name="eye"/>, then restores it.</summary>
+        void RenderEye(Camera cam, RenderTexture rt, Vector3 eye, GameProjection original)
+        {
+            var tr = cam.transform;
+            var savedPos = tr.position;
+            var savedRot = tr.rotation;
+            var savedTarget = cam.targetTexture;
             try
             {
-                var dir = BepInEx.Paths.BepInExRootPath;
-                SaveRT(leftRT, System.IO.Path.Combine(dir, "OlliVR_capture_L.png"));
-                SaveRT(rightRT, System.IO.Path.Combine(dir, "OlliVR_capture_R.png"));
-                if (ui != null) SaveRT(ui.Texture, System.IO.Path.Combine(dir, "OlliVR_capture_UI.png"));
-                if (ui?.ScreenTexture != null && flatCams.Count > 0) SaveRT(ui.ScreenTexture, System.IO.Path.Combine(dir, "OlliVR_capture_Screen.png"));
-                var sb = new System.Text.StringBuilder();
-                sb.AppendLine($"Capture: hmdPos={hmdPos.ToString("F3")} hmdRot={hmdRot.eulerAngles.ToString("F1")} " +
-                              $"headPos={headPos.ToString("F3")} headRot={headRot.eulerAngles.ToString("F1")} origin={originPos.ToString("F3")}/{originRot.eulerAngles.ToString("F1")}");
-                foreach (var c in stereoCams)
+                cam.targetTexture = rt;
+                if (!cam.orthographic)
                 {
-                    sb.AppendLine($"  cam '{c.name}' pos={c.transform.position.ToString("F2")} rot={c.transform.rotation.eulerAngles.ToString("F1")} " +
-                                  $"fov={c.fieldOfView} aspect={c.aspect} usePhysical={c.usePhysicalProperties} lensShift={c.lensShift}");
-                    sb.AppendLine("  game projection:\n" + c.projectionMatrix);
-                    sb.AppendLine("  worldToCamera:\n" + c.worldToCameraMatrix);
-                    var comps = c.GetComponents(Il2CppType.Of<Component>());
-                    var names = new List<string>();
-                    foreach (var co in comps) if (co != null) names.Add(co.GetIl2CppType().FullName);
-                    sb.AppendLine("  components: " + string.Join(", ", names));
+                    EyeView(cam, original.Matrix, eye, out var pos, out var proj);
+                    tr.SetPositionAndRotation(pos, savedRot);
+                    cam.projectionMatrix = proj;
                 }
-                Plugin.L.LogInfo(sb.ToString());
+                // Orthographic views (world map) have no depth: rendered unchanged in both eyes.
+                cam.Render();
             }
-            catch (Exception e) { Plugin.L.LogError("Capture failed: " + e); }
+            finally
+            {
+                cam.targetTexture = savedTarget;
+                if (original.Custom) cam.projectionMatrix = original.Matrix;
+                else cam.ResetProjectionMatrix();
+                tr.SetPositionAndRotation(savedPos, savedRot);
+            }
         }
 
-        static void SaveRT(RenderTexture rt, string path)
+        /// <summary>
+        /// Off-axis view of <paramref name="cam"/>'s scene from <paramref name="eye"/> (screen space, metres)
+        /// through the screen rectangle. The screen maps to the game's image plane at the convergence distance,
+        /// so objects at that distance sit on the screen surface.
+        /// </summary>
+        void EyeView(Camera cam, Matrix4x4 gp, Vector3 eye, out Vector3 pos, out Matrix4x4 proj)
         {
+            var tr = cam.transform;
+            float w = screen.WidthMeters, h = screen.HeightMeters;
+            float ez = Mathf.Max(0.05f, -eye.z);
+            float d = convergence > 0f ? convergence : 15f;
+
+            // The game's camera uses an off-centre (lens-shifted) frustum, so the skater sits left of centre.
+            // Read the window the game actually shows from its projection: centre (cx, cy) and half-height
+            // as view-space tangents.
+            float halfH = gp.m11 != 0f ? 1f / gp.m11 : Mathf.Tan(cam.fieldOfView * 0.5f * Mathf.Deg2Rad);
+            float cx = gp.m00 != 0f ? gp.m02 / gp.m00 : 0f;
+            float cy = gp.m11 != 0f ? gp.m12 / gp.m11 : 0f;
+
+            // Game units per real metre: the screen height covers the game frame height at distance d.
+            float s = 2f * d * halfH / h;
+            var screenCenter = tr.position + tr.rotation * new Vector3(cx * d, cy * d, d);
+            pos = screenCenter + tr.rotation * new Vector3(eye.x * s, eye.y * s, -ez * s);
+            proj = VRSession.Frustum(
+                (-w * 0.5f - eye.x) / ez, (w * 0.5f - eye.x) / ez,
+                (-h * 0.5f - eye.y) / ez, (h * 0.5f - eye.y) / ez, cam.nearClipPlane, cam.farClipPlane);
+        }
+
+        Material opaqueMat;
+        bool opaqueMatFailed;
+
+        /// <summary>
+        /// The game's cameras leave alpha at 0, and SteamVR overlays treat alpha as transparency, so the screen
+        /// would be invisible. Draws a full-texture quad that adds 1 to alpha and leaves RGB untouched
+        /// (additive blend of black with alpha 1; UNORM alpha saturates at 1).
+        /// </summary>
+        void ForceOpaque(RenderTexture rt)
+        {
+            if (opaqueMat == null && !opaqueMatFailed)
+            {
+                var sh = Shader.Find("Hidden/Internal-Colored");
+                if (sh == null) { opaqueMatFailed = true; Plugin.L.LogError("Shader Hidden/Internal-Colored not found; screen may be transparent."); return; }
+                opaqueMat = new Material(sh) { hideFlags = HideFlags.HideAndDontSave };
+                opaqueMat.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.One);
+                opaqueMat.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.One);
+                opaqueMat.SetInt("_Cull", (int)UnityEngine.Rendering.CullMode.Off);
+                opaqueMat.SetInt("_ZWrite", 0);
+                opaqueMat.SetInt("_ZTest", (int)UnityEngine.Rendering.CompareFunction.Always);
+                UnityEngine.Object.DontDestroyOnLoad(opaqueMat);
+            }
+            if (opaqueMat == null) return;
+
             var prev = RenderTexture.active;
             RenderTexture.active = rt;
-            var tex = new Texture2D(rt.width, rt.height, TextureFormat.RGB24, false);
-            tex.ReadPixels(new Rect(0, 0, rt.width, rt.height), 0, 0);
-            tex.Apply();
+            GL.PushMatrix();
+            GL.LoadOrtho();
+            opaqueMat.SetPass(0);
+            GL.Begin(GL.QUADS);
+            GL.Color(new Color(0f, 0f, 0f, 1f));
+            GL.Vertex3(0f, 0f, 0f);
+            GL.Vertex3(0f, 1f, 0f);
+            GL.Vertex3(1f, 1f, 0f);
+            GL.Vertex3(1f, 0f, 0f);
+            GL.End();
+            GL.PopMatrix();
             RenderTexture.active = prev;
-            System.IO.File.WriteAllBytes(path, ImageConversion.EncodeToPNG(tex));
-            UnityEngine.Object.Destroy(tex);
         }
 
-        // ---- Auto framing -------------------------------------------------------------------------
-        // The game films the skater with a narrow (~33°) lens from far away. Seen through a ~110° headset
-        // from the same spot, everything looks tiny and distant. We move the viewpoint forward along the
-        // camera axis so the game's framed area spans FramedFOV degrees of your vision instead.
-        float framingPull, focusDistance;
-        float nextFramingLog;
-
-        void UpdateFraming(Camera cam)
+        /// <summary>
+        /// Position of an eye relative to the screen centre, in the screen's frame. Head movement away from the
+        /// recentered position is scaled by HeadCoupled; eye separation by DepthStrength.
+        /// </summary>
+        Vector3 EyeInScreenSpace(Vector3 hmdPos, Quaternion hmdRot, Vector3 eyeOffset)
         {
-            if (!Plugin.Cfg.AutoFrame.Value || cam.orthographic) { framingPull = 0; return; }
+            var inv = Quaternion.Inverse(screen.Rotation);
+            var nominalHead = inv * (originPos - screen.Center);
+            var head = inv * (hmdPos - screen.Center);
+            float coupled = Mathf.Clamp01(Plugin.Cfg.HeadCoupled.Value);
+            head = nominalHead + (head - nominalHead) * coupled;
 
-            float d = Plugin.Cfg.FocusDistance.Value;
+            // With head coupling the eyes follow head rotation; without it they stay level and square to the screen.
+            var tracked = inv * (hmdRot * eyeOffset);
+            var level = new Vector3(eyeOffset.x, 0f, 0f);
+            var offset = Vector3.Lerp(level, tracked, coupled) * Mathf.Max(0f, Plugin.Cfg.DepthStrength.Value);
+            return head + offset;
+        }
+
+
+        // ---- Convergence (what sits on the screen surface) ---------------------------------------
+
+        void UpdateConvergence(Camera cam)
+        {
+            float d = Plugin.Cfg.ConvergenceDistance.Value;
             float cmDist = 0, rayDist = 0;
             if (d <= 0f)
             {
@@ -334,20 +464,16 @@ namespace OlliVR
                 rayDist = GetRaycastFocusDistance(cam);
                 if (cmDist > 0 && rayDist > 0) d = Mathf.Min(cmDist, rayDist);
                 else d = Mathf.Max(cmDist, rayDist);
+                if (d <= 0f) d = convergence > 0 ? convergence : 15f;
+                // Smooth so cuts and passing foreground objects don't make the depth pump.
+                convergence = convergence <= 0 ? d : Mathf.Lerp(convergence, d, 1f - Mathf.Exp(-Time.unscaledDeltaTime * 1.5f));
             }
-            if (d <= 0f) d = focusDistance > 0 ? focusDistance : 15f;
-            // Smooth so cuts and passing foreground objects don't snap the view.
-            focusDistance = focusDistance <= 0 ? d : Mathf.Lerp(focusDistance, d, 1f - Mathf.Exp(-Time.unscaledDeltaTime * 1.5f));
+            else convergence = d;
 
-            float gameHalf = cam.fieldOfView * 0.5f * Mathf.Deg2Rad;
-            float vrHalf = Mathf.Clamp(Plugin.Cfg.FramedFOV.Value, 10f, 150f) * 0.5f * Mathf.Deg2Rad;
-            float newDist = focusDistance * Mathf.Tan(gameHalf) / Mathf.Tan(vrHalf);
-            framingPull = Mathf.Max(0f, focusDistance - newDist);
-
-            if (Plugin.Cfg.VerboseLogging.Value && Time.unscaledTime >= nextFramingLog)
+            if (Plugin.Cfg.VerboseLogging.Value && Time.unscaledTime >= nextConvergenceLog)
             {
-                nextFramingLog = Time.unscaledTime + 10f;
-                Plugin.L.LogInfo($"Framing: cinemachine {cmDist:0.0}, raycast {rayDist:0.0}, focus distance {focusDistance:0.0}, game fov {cam.fieldOfView:0.0}, pull-in {framingPull:0.0} -> view distance {newDist:0.0}");
+                nextConvergenceLog = Time.unscaledTime + 10f;
+                Plugin.L.LogInfo($"Convergence: cinemachine {cmDist:0.0}, raycast {rayDist:0.0} -> {convergence:0.0} (game fov {cam.fieldOfView:0.0})");
             }
         }
 
@@ -356,7 +482,6 @@ namespace OlliVR
             try
             {
                 var t = cam.transform;
-                // Average a few rays around the centre to avoid snapping on thin objects.
                 float sum = 0; int hits = 0;
                 for (int i = -1; i <= 1; i++)
                 {
@@ -388,23 +513,173 @@ namespace OlliVR
             catch { return 0f; }
         }
 
-        bool dumpCameras = true;
-        int lastCamCount = -1;
-        float nextDump;
+        // ---- Camera discovery ----------------------------------------------------------------------
 
-        void DumpCameras()
+        // Cameras the game rendered to the screen this frame. The game renders cameras manually
+        // (they stay disabled), so Camera.allCameras is empty; onPreCull fires for manual renders too.
+        readonly List<Camera> renderedThisFrame = new();
+        int renderedFrame = -1;
+        bool insideVRRender { get => InsideVRRenderStatic; set => InsideVRRenderStatic = value; }
+        internal static bool InsideVRRenderStatic;
+        readonly Dictionary<string, int> preCullCounts = new();
+
+        void OnAnyPreCull(Camera c)
         {
-            var all = UnityEngine.Object.FindObjectsOfType(Il2CppType.Of<Camera>(), true);
-            Plugin.L.LogInfo($"--- Camera dump ({Camera.allCamerasCount} enabled, {all.Length} total; main={(Camera.main == null ? "null" : Camera.main.name)}) ---");
-            for (int i = 0; i < all.Length; i++)
+            if (insideVRRender || c == null) return;
+            if (renderedFrame != Time.frameCount) { renderedFrame = Time.frameCount; renderedThisFrame.Clear(); }
+            if (Plugin.Cfg.VerboseLogging.Value)
             {
-                var c = all[i].Cast<Camera>();
-                if (c == null) continue;
-                var tt = c.targetTexture;
-                Plugin.L.LogInfo($"  '{c.name}' path={PathOf(c.transform)} depth={c.depth} enabled={c.enabled} goActive={c.gameObject.activeInHierarchy} " +
-                                 $"target={(tt == null ? "screen" : $"{tt.name} {tt.width}x{tt.height}")} mask=0x{c.cullingMask:X} " +
-                                 $"clear={c.clearFlags} ortho={c.orthographic} fov={c.fieldOfView:0.#} near={c.nearClipPlane} far={c.farClipPlane}");
+                var key = c.name + (c.targetTexture == null ? " -> screen" : " -> " + c.targetTexture.name);
+                preCullCounts[key] = preCullCounts.TryGetValue(key, out var n) ? n + 1 : 1;
             }
+            if (c.targetTexture == null && !renderedThisFrame.Contains(c)) renderedThisFrame.Add(c);
+        }
+
+        void CollectCameras()
+        {
+            screenCams.Clear();
+            gameUICams.Clear();
+            // Called at end of frame: the cameras the game rendered this frame.
+            if (renderedFrame != Time.frameCount) return;
+            for (int i = 0; i < renderedThisFrame.Count; i++)
+            {
+                var c = renderedThisFrame[i];
+                if (c == null || c.targetTexture != null) continue;
+                if (c == screen.UICamera) continue;
+                if ((c.cullingMask & ~UILayerMask) == 0)
+                {
+                    // The game's own UI-only camera: world-space UI such as map markers, the map cursor and
+                    // level signs. Drawn unchanged on top of the scene in both eyes.
+                    gameUICams.Add(c);
+                    continue;
+                }
+                screenCams.Add(c);
+
+                if (loggedCams.Add(c.name))
+                    Plugin.L.LogInfo($"Screen camera '{c.name}': depth={c.depth} ortho={c.orthographic} fov={c.fieldOfView:0.#} " +
+                                     $"near={c.nearClipPlane} far={c.farClipPlane} mask=0x{c.cullingMask:X} clear={c.clearFlags}");
+            }
+            screenCams.Sort((a, b) => a.depth.CompareTo(b.depth));
+            gameUICams.Sort((a, b) => a.depth.CompareTo(b.depth));
+        }
+
+        /// <summary>Renders a camera unchanged on top of what is already in <paramref name="rt"/>.</summary>
+        static void RenderOnTop(Camera cam, RenderTexture rt)
+        {
+            var savedTarget = cam.targetTexture;
+            var savedClear = cam.clearFlags;
+            try
+            {
+                cam.targetTexture = rt;
+                cam.clearFlags = CameraClearFlags.Depth;
+                cam.Render();
+            }
+            finally
+            {
+                cam.targetTexture = savedTarget;
+                cam.clearFlags = savedClear;
+            }
+        }
+
+        // ---- Diagnostics -----------------------------------------------------------------------------
+
+        void Capture(Vector3 hmdPos, Quaternion hmdRot)
+        {
+            try
+            {
+                var dir = BepInEx.Paths.BepInExRootPath;
+                SaveRT(screen.StereoTexture, System.IO.Path.Combine(dir, "OlliVR_capture_Stereo.png"));
+                {
+                    var prev = RenderTexture.active;
+                    RenderTexture.active = screen.StereoTexture;
+                    var px = new Texture2D(1, 1, TextureFormat.RGBA32, false);
+                    px.ReadPixels(new Rect(screen.EyeWidth / 2, screen.EyeHeight / 2, 1, 1), 0, 0);
+                    px.Apply();
+                    RenderTexture.active = prev;
+                    Plugin.L.LogInfo($"Stereo texture centre pixel: {px.GetPixel(0, 0)}");
+                    UnityEngine.Object.Destroy(px);
+
+                    SaveRT(screen.UITexture, System.IO.Path.Combine(dir, "OlliVR_capture_UI.png"));
+                    var ui = screen.UITexture;
+                    RenderTexture.active = ui;
+                    var full = new Texture2D(ui.width, ui.height, TextureFormat.RGBA32, false);
+                    full.ReadPixels(new Rect(0, 0, ui.width, ui.height), 0, 0);
+                    full.Apply();
+                    RenderTexture.active = prev;
+                    float sumA = 0; int opaque = 0, n = 0;
+                    for (int y = 0; y < ui.height; y += 40)
+                        for (int x = 0; x < ui.width; x += 40)
+                        {
+                            float a = full.GetPixel(x, y).a;
+                            sumA += a; n++;
+                            if (a > 0.9f) opaque++;
+                        }
+                    Plugin.L.LogInfo($"UI texture alpha: mean {sumA / n:0.000}, {100f * opaque / n:0.0}% of samples opaque");
+                    UnityEngine.Object.Destroy(full);
+                }
+                var sb = new System.Text.StringBuilder();
+                sb.AppendLine($"Capture: hmdPos={hmdPos.ToString("F3")} hmdRot={hmdRot.eulerAngles.ToString("F1")} " +
+                              $"origin={originPos.ToString("F3")} screen {screen.WidthMeters:0.00}x{screen.HeightMeters:0.00} m " +
+                              $"convergence={convergence:0.0} eyeL={EyeInScreenSpace(hmdPos, hmdRot, eyeOffsetL).ToString("F3")} " +
+                              $"eyeR={EyeInScreenSpace(hmdPos, hmdRot, eyeOffsetR).ToString("F3")}");
+                if (Plugin.Cfg.VerboseLogging.Value) DumpUI(sb);
+                foreach (var c in screenCams)
+                    sb.AppendLine($"  cam '{c.name}' pos={c.transform.position.ToString("F2")} rot={c.transform.rotation.eulerAngles.ToString("F1")} " +
+                                  $"fov={c.fieldOfView} ortho={c.orthographic} physical={c.usePhysicalProperties} lensShift={c.lensShift} " +
+                                  $"proj m00={c.projectionMatrix.m00:0.###} m02={c.projectionMatrix.m02:0.###} m11={c.projectionMatrix.m11:0.###} m12={c.projectionMatrix.m12:0.###}");
+                Plugin.L.LogInfo(sb.ToString());
+            }
+            catch (Exception e) { Plugin.L.LogError("Capture failed: " + e); }
+        }
+
+        /// <summary>Lists active UI graphics and any renderers living under canvases (diagnostics).</summary>
+        static void DumpUI(System.Text.StringBuilder sb)
+        {
+            try
+            {
+                sb.AppendLine("  --- UI graphics ---");
+                foreach (var o in UnityEngine.Object.FindObjectsOfType(Il2CppType.Of<UnityEngine.UI.Graphic>()))
+                {
+                    var g = o.Cast<UnityEngine.UI.Graphic>();
+                    if (g == null || !g.isActiveAndEnabled) continue;
+                    var mat = g.materialForRendering;
+                    var canvas = g.canvas;
+                    sb.AppendLine($"    {g.GetIl2CppType().Name} '{PathOf(g.transform)}' layer={g.gameObject.layer} color={g.color} " +
+                                  $"shader={(mat != null && mat.shader != null ? mat.shader.name : "null")} " +
+                                  $"canvas={(canvas != null ? canvas.rootCanvas.name + "/" + canvas.rootCanvas.renderMode : "none")}");
+                }
+                sb.AppendLine("  --- Dialogue detail ---");
+                foreach (var o in UnityEngine.Object.FindObjectsOfType(Il2CppType.Of<RectTransform>()))
+                {
+                    var rt = o.Cast<RectTransform>();
+                    if (rt == null) continue;
+                    var path = PathOf(rt);
+                    if (!path.Contains("View - Dialogue")) continue;
+                    var line = $"    '{path}' active={rt.gameObject.activeInHierarchy} size={rt.rect.size} pos={rt.position} scale={rt.lossyScale}";
+                    var cr = rt.GetComponent<CanvasRenderer>();
+                    if (cr != null) line += $" cull={cr.cull} alpha={cr.GetAlpha()} hasMoved={cr.hasMoved}";
+                    var tmp = rt.GetComponent<TMPro.TMP_Text>();
+                    if (tmp != null) line += $" text='{tmp.text}' visibleChars={tmp.maxVisibleCharacters} chars={tmp.textInfo?.characterCount} enabled={tmp.enabled}";
+                    if (rt.GetComponent<UnityEngine.UI.RectMask2D>() != null) line += " [RectMask2D]";
+                    if (rt.GetComponent<UnityEngine.UI.Mask>() != null) line += " [Mask]";
+                    var behaviours = rt.GetComponents<Behaviour>();
+                    var names = new List<string>();
+                    foreach (var b in behaviours) if (b != null) names.Add(b.GetIl2CppType().Name + (b.enabled ? "" : "(off)"));
+                    line += " {" + string.Join(",", names) + "}";
+                    sb.AppendLine(line);
+                }
+                sb.AppendLine("  --- Renderers under canvases ---");
+                foreach (var o in UnityEngine.Object.FindObjectsOfType(Il2CppType.Of<Renderer>()))
+                {
+                    var r = o.Cast<Renderer>();
+                    if (r == null || !r.enabled || !r.gameObject.activeInHierarchy) continue;
+                    if (r.GetComponentInParent<Canvas>() == null) continue;
+                    var m = r.sharedMaterial;
+                    sb.AppendLine($"    {r.GetIl2CppType().Name} '{PathOf(r.transform)}' layer={r.gameObject.layer} pos={r.transform.position} " +
+                                  $"shader={(m != null && m.shader != null ? m.shader.name : "null")}");
+                }
+            }
+            catch (Exception e) { sb.AppendLine("  UI dump failed: " + e.Message); }
         }
 
         static string PathOf(Transform t)
@@ -414,20 +689,31 @@ namespace OlliVR
             return s;
         }
 
-        // Cameras the game rendered to the screen this frame. The game renders cameras manually
-        // (they stay disabled), so Camera.allCameras is empty; onPreCull fires for manual renders too.
-        readonly List<Camera> renderedThisFrame = new();
-        int renderedFrame = -1;
-        bool insideVRRender;
-        readonly Dictionary<string, int> preCullCounts = new();
-
-        void OnAnyPreCull(Camera c)
+        static void SaveRT(RenderTexture rt, string path)
         {
-            if (insideVRRender || c == null) return;
-            if (renderedFrame != Time.frameCount) { renderedFrame = Time.frameCount; renderedThisFrame.Clear(); }
-            var key = c.name + (c.targetTexture == null ? " -> screen" : " -> " + c.targetTexture.name);
-            preCullCounts[key] = preCullCounts.TryGetValue(key, out var n) ? n + 1 : 1;
-            if (c.targetTexture == null && !renderedThisFrame.Contains(c)) renderedThisFrame.Add(c);
+            var prev = RenderTexture.active;
+            RenderTexture.active = rt;
+            var tex = new Texture2D(rt.width, rt.height, TextureFormat.RGB24, false);
+            tex.ReadPixels(new Rect(0, 0, rt.width, rt.height), 0, 0);
+            tex.Apply();
+            RenderTexture.active = prev;
+            System.IO.File.WriteAllBytes(path, ImageConversion.EncodeToPNG(tex));
+            UnityEngine.Object.Destroy(tex);
+        }
+
+        void DumpCameras()
+        {
+            var all = UnityEngine.Object.FindObjectsOfType(Il2CppType.Of<Camera>(), true);
+            Plugin.L.LogInfo($"--- Camera dump ({all.Length} total) ---");
+            for (int i = 0; i < all.Length; i++)
+            {
+                var c = all[i].Cast<Camera>();
+                if (c == null) continue;
+                var tt = c.targetTexture;
+                Plugin.L.LogInfo($"  '{c.name}' depth={c.depth} enabled={c.enabled} goActive={c.gameObject.activeInHierarchy} " +
+                                 $"target={(tt == null ? "screen" : $"{tt.name} {tt.width}x{tt.height}")} mask=0x{c.cullingMask:X} " +
+                                 $"ortho={c.orthographic} fov={c.fieldOfView:0.#}");
+            }
         }
 
         void LogPreCullStats()
@@ -435,106 +721,6 @@ namespace OlliVR
             if (preCullCounts.Count == 0) { Plugin.L.LogInfo($"[frame {Time.frameCount}] no camera renders seen in the last interval"); return; }
             foreach (var kv in preCullCounts) Plugin.L.LogInfo($"[frame {Time.frameCount}] rendered: {kv.Key} x{kv.Value}");
             preCullCounts.Clear();
-        }
-
-        void CollectCameras()
-        {
-            stereoCams.Clear();
-            flatCams.Clear();
-            if (renderedFrame != Time.frameCount) return;
-            for (int i = 0; i < renderedThisFrame.Count; i++)
-            {
-                var c = renderedThisFrame[i];
-                if (c == null) continue;
-                if (c.targetTexture != null) continue;              // off-screen / our own UI cam
-                if (ui != null && c == ui.Camera) continue;
-                if ((c.cullingMask & ~uiLayerMask) == 0) continue;  // pure UI camera
-                // Orthographic views (world map) have no depth to show; they go on the flat virtual screen.
-                bool flat = c.orthographic && ui != null && ui.ScreenTexture != null;
-                (flat ? flatCams : stereoCams).Add(c);
-
-                if (loggedCams.Add(c.name))
-                    Plugin.L.LogInfo($"{(flat ? "Flat" : "Stereo")} camera '{c.name}': depth={c.depth} ortho={c.orthographic} fov={c.fieldOfView:0.#} " +
-                                     $"near={c.nearClipPlane} far={c.farClipPlane} mask=0x{c.cullingMask:X} clear={c.clearFlags} pos={c.transform.position}");
-            }
-            stereoCams.Sort((a, b) => a.depth.CompareTo(b.depth));
-            flatCams.Sort((a, b) => a.depth.CompareTo(b.depth));
-        }
-
-        /// <summary>Renders orthographic cameras unchanged (own projection, no head tracking) to the virtual screen.</summary>
-        void RenderFlat()
-        {
-            var rt = ui.ScreenTexture;
-            insideVRRender = true;
-            try
-            {
-                for (int i = 0; i < flatCams.Count; i++)
-                {
-                    var cam = flatCams[i];
-                    var saved = cam.targetTexture;
-                    try
-                    {
-                        cam.targetTexture = rt;
-                        if (i == 0 && cam.clearFlags == CameraClearFlags.Nothing)
-                        {
-                            var prev = RenderTexture.active;
-                            RenderTexture.active = rt; GL.Clear(true, true, Color.black);
-                            RenderTexture.active = prev;
-                        }
-                        cam.Render();
-                    }
-                    finally { cam.targetTexture = saved; }
-                }
-            }
-            finally { insideVRRender = false; }
-        }
-
-        void RenderEye(EVREye eye, RenderTexture rt, Vector3 headPos, Quaternion headRot)
-        {
-            float scale = Plugin.Cfg.WorldScale.Value;
-            float pull = Plugin.Cfg.CameraPullIn.Value + framingPull;
-
-            for (int i = 0; i < stereoCams.Count; i++)
-            {
-                var cam = stereoCams[i];
-                var tr = cam.transform;
-                var savedPos = tr.position;
-                var savedRot = tr.rotation;
-                var savedTarget = cam.targetTexture;
-                bool savedOrtho = cam.orthographic;
-
-                VRSession.GetEye(eye, cam.nearClipPlane, cam.farClipPlane, out var eyeOff, out var eyeRotOff, out var proj);
-
-                var basePos = savedPos + savedRot * (Vector3.forward * pull);
-                var rot = savedRot * headRot;
-                var pos = basePos + savedRot * (headPos * scale) + rot * (eyeOff * scale);
-
-                try
-                {
-                    tr.SetPositionAndRotation(pos, rot * eyeRotOff);
-                    cam.orthographic = false;
-                    cam.projectionMatrix = proj;
-                    cam.targetTexture = rt;
-                    // The first (deepest) camera must clear the eye texture; stacked cameras composite on top.
-                    if (i == 0 && cam.clearFlags == CameraClearFlags.Nothing)
-                    {
-                        var prevActive = RenderTexture.active;
-                        RenderTexture.active = rt;
-                        GL.Clear(true, true, Color.black);
-                        RenderTexture.active = prevActive;
-                    }
-                    VRSession.Trace($"Render {cam.name} {eye}");
-                    cam.Render();
-                    VRSession.Trace($"Render {cam.name} {eye} done");
-                }
-                finally
-                {
-                    cam.targetTexture = savedTarget;
-                    cam.orthographic = savedOrtho;
-                    cam.ResetProjectionMatrix();
-                    tr.SetPositionAndRotation(savedPos, savedRot);
-                }
-            }
         }
 
         void OnDestroy()

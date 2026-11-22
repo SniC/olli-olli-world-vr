@@ -137,12 +137,20 @@ namespace OlliVR
             return EventSubmitEyesBase + slot;
         }
 
+        public static bool RecenterRequested;
+
         public static void PollEvents()
         {
             var ev = new VREvent_t();
             uint size = (uint)Marshal.SizeOf<VREvent_t>();
             while (System.PollNextEvent(ref ev, size))
             {
+                if ((EVREventType)ev.eventType == EVREventType.VREvent_TrackedDeviceUserInteractionStarted &&
+                    ev.trackedDeviceIndex == OpenVR.k_unTrackedDeviceIndex_Hmd)
+                {
+                    // Headset put on: put the screen in front of the user.
+                    RecenterRequested = true;
+                }
                 if ((EVREventType)ev.eventType == EVREventType.VREvent_Quit)
                 {
                     Plugin.L.LogInfo("SteamVR requested quit.");
@@ -152,21 +160,15 @@ namespace OlliVR
             }
         }
 
-        public static void GetEye(EVREye eye, float near, float far, out Vector3 eyePos, out Quaternion eyeRot, out Matrix4x4 proj)
+        /// <summary>Eye position relative to the head (metres, Unity convention).</summary>
+        public static Vector3 GetEyeOffset(EVREye eye)
         {
-            ToUnity(System.GetEyeToHeadTransform(eye), out eyePos, out eyeRot);
-            // SteamVR's own OpenGL-convention projection (same convention as Camera.projectionMatrix).
-            var p = System.GetProjectionMatrix(eye, near, far);
-            proj = new Matrix4x4();
-            proj.m00 = p.m0; proj.m01 = p.m1; proj.m02 = p.m2; proj.m03 = p.m3;
-            proj.m10 = p.m4; proj.m11 = p.m5; proj.m12 = p.m6; proj.m13 = p.m7;
-            proj.m20 = p.m8; proj.m21 = p.m9; proj.m22 = p.m10; proj.m23 = p.m11;
-            proj.m30 = p.m12; proj.m31 = p.m13; proj.m32 = p.m14; proj.m33 = p.m15;
-            Trace($"  eye {eye}: pos={eyePos.ToString("F4")} proj=\n{proj}");
+            ToUnity(System.GetEyeToHeadTransform(eye), out var pos, out _);
+            return pos;
         }
 
-        /// <summary>OpenGL-style off-centre projection from view-space tangents.</summary>
-        static Matrix4x4 Frustum(float left, float right, float bottom, float top, float n, float f)
+        /// <summary>OpenGL-style off-centre projection from view-space tangents (extent / distance).</summary>
+        public static Matrix4x4 Frustum(float left, float right, float bottom, float top, float n, float f)
         {
             var m = new Matrix4x4();
             m.m00 = 2f / (right - left);
@@ -210,6 +212,7 @@ namespace OlliVR
         public static void SetScreenTexture(IntPtr tex) => screenTex = tex;
         public static ulong ScreenHandle;
         static volatile IntPtr screenTex;
+        static int overlayErrorsLogged;
         public const int EventSubmitScreen = 3;
 
         [UnmanagedCallersOnly]
@@ -237,13 +240,15 @@ namespace OlliVR
                 {
                     if (screenTex == IntPtr.Zero || ScreenHandle == 0 || Overlay == null) return;
                     var t = new Texture_t { handle = screenTex, eType = ETextureType.DirectX, eColorSpace = EColorSpace.Auto };
-                    Overlay.SetOverlayTexture(ScreenHandle, ref t);
+                    var e = Overlay.SetOverlayTexture(ScreenHandle, ref t);
+                    if (e != EVROverlayError.None && overlayErrorsLogged++ < 10) Plugin.L.LogWarning("SetOverlayTexture (screen) failed: " + e);
                 }
                 else if (id == EventSubmitOverlay)
                 {
                     if (overlayTex == IntPtr.Zero || OverlayHandle == 0 || Overlay == null) return;
                     var t = new Texture_t { handle = overlayTex, eType = ETextureType.DirectX, eColorSpace = EColorSpace.Auto };
-                    Overlay.SetOverlayTexture(OverlayHandle, ref t);
+                    var e = Overlay.SetOverlayTexture(OverlayHandle, ref t);
+                    if (e != EVROverlayError.None && overlayErrorsLogged++ < 10) Plugin.L.LogWarning("SetOverlayTexture (ui) failed: " + e);
                 }
             }
             catch (Exception e)
