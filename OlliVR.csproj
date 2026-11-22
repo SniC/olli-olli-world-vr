@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <AssemblyName>OlliVR</AssemblyName>
+    <RootNamespace>OlliVR</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Nullable>disable</Nullable>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS0618;CS0649;CS0169;CS0414;CA1416</NoWarn>
+
+    <!-- Override on the command line: dotnet build -p:GameDir="..." -->
+    <GameDir Condition="'$(GameDir)' == ''">D:\SteamLibrary\steamapps\common\OlliOlli World</GameDir>
+    <SteamVRDir Condition="'$(SteamVRDir)' == ''">C:\Program Files (x86)\Steam\steamapps\common\SteamVR</SteamVRDir>
+    <BepInExDir>$(GameDir)\BepInEx</BepInExDir>
+    <PluginOutDir>$(BepInExDir)\plugins\OlliVR</PluginOutDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="$(BepInExDir)\core\BepInEx.Core.dll" Private="false" />
+    <Reference Include="$(BepInExDir)\core\BepInEx.Unity.IL2CPP.dll" Private="false" />
+    <Reference Include="$(BepInExDir)\core\BepInEx.Unity.Common.dll" Private="false" />
+    <Reference Include="$(BepInExDir)\core\Il2CppInterop.Runtime.dll" Private="false" />
+    <Reference Include="$(BepInExDir)\core\Il2CppInterop.Common.dll" Private="false" />
+    <Reference Include="$(BepInExDir)\interop\Il2Cppmscorlib.dll" Private="false" />
+    <Reference Include="$(BepInExDir)\interop\UnityEngine.dll" Private="false" />
+    <Reference Include="$(BepInExDir)\interop\UnityEngine.CoreModule.dll" Private="false" />
+    <Reference Include="$(BepInExDir)\interop\UnityEngine.UIModule.dll" Private="false" />
+    <Reference Include="$(BepInExDir)\interop\UnityEngine.PhysicsModule.dll" Private="false" />
+    <Reference Include="$(BepInExDir)\interop\UnityEngine.ImageConversionModule.dll" Private="false" />
+    <Reference Include="$(BepInExDir)\interop\Unity.InputSystem.dll" Private="false" />
+    <Reference Include="$(BepInExDir)\interop\Cinemachine.dll" Private="false" />
+    <Reference Include="$(BepInExDir)\interop\Unity.Postprocessing.Runtime.dll" Private="false" />
+  </ItemGroup>
+
+  <Target Name="DeployToGame" AfterTargets="Build" Condition="Exists('$(BepInExDir)') And '$(Deploy)' != 'false'">
+    <MakeDir Directories="$(PluginOutDir)" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(PluginOutDir)" />
+    <Copy SourceFiles="$(SteamVRDir)\bin\win64\openvr_api.dll" DestinationFolder="$(PluginOutDir)" Condition="Exists('$(SteamVRDir)\bin\win64\openvr_api.dll')" SkipUnchangedFiles="true" />
+    <Message Importance="high" Text="OlliVR deployed to $(PluginOutDir)" />
+  </Target>
+
+</Project>
