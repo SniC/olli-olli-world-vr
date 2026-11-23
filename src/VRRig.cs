@@ -342,7 +342,12 @@ namespace OlliVR
                 if (!cam.orthographic)
                 {
                     EyeView(cam, original.Matrix, eye, out var pos, out var proj);
-                    tr.SetPositionAndRotation(pos, savedRot);
+                    // The eye viewpoint goes in through the view matrix only; the camera's transform stays where
+                    // the game put it. The game's shadow code fits its shadow maps to the camera transform, so
+                    // moving the transform per eye (and with every head movement) made shadows shimmer and differ
+                    // between the eyes.
+                    cam.worldToCameraMatrix = Matrix4x4.Scale(new Vector3(1f, 1f, -1f)) *
+                                              Matrix4x4.TRS(pos, savedRot, Vector3.one).inverse;
                     cam.projectionMatrix = proj;
                 }
                 // Orthographic views (world map) have no depth: rendered unchanged in both eyes.
@@ -351,6 +356,7 @@ namespace OlliVR
             finally
             {
                 cam.targetTexture = savedTarget;
+                cam.ResetWorldToCameraMatrix();
                 cam.ResetProjectionMatrix();
                 tr.SetPositionAndRotation(savedPos, savedRot);
             }
