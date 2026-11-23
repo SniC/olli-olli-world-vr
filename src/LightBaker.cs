@@ -101,7 +101,7 @@ namespace OlliVR
                 if (l.Kind == Kind.Lamp)
                 {
                     float v = MathF.Abs(dir.Y);
-                    shape = 0.08f + 1.4f * v * v * v;   // dense shade: light leaves through top and bottom
+                    shape = 0.4f + 1.1f * v * v;         // fabric shade: soft light through it, brighter pools up and down
                 }
                 float vis = l.Kind == Kind.Fire ? FireVisibility(p) : 1f;
                 if (vis <= 0f) continue;

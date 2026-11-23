@@ -71,9 +71,9 @@ namespace OlliVR
             Occluders.Clear();
             Candles.Clear();
             Glows.Clear();
-            var lampCol = new Color(1.0f, 0.60f, 0.28f) * 0.95f;
+            var lampCol = new Color(1.0f, 0.60f, 0.28f) * 1.9f;
             float lampZ = ZFront - 0.35f;
-            lights.Add(new PointLight { Pos = new Vector3(2.35f, F + 1.42f, lampZ), Col = lampCol, Radius = 1.1f, Lamp = true });
+            lights.Add(new PointLight { Pos = new Vector3(2.35f, F + 1.42f, lampZ), Col = lampCol, Radius = 0.75f, Lamp = true });
             LampPos = new Vector3(2.35f, F + 1.42f, lampZ);
             var chandelierPos = new Vector3(0f, F + 2.75f, 0.2f);
             var chandelierSamples = new Vector3[8];
