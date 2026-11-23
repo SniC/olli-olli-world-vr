@@ -43,7 +43,7 @@ namespace OlliVR
             try
             {
                 var ov = VRSession.Overlay;
-                if (ov == null) { Plugin.L.LogError("IVROverlay unavailable; cannot show the virtual screen."); return false; }
+                if (ov == null && !VRSession.Headless) { Plugin.L.LogError("IVROverlay unavailable; cannot show the virtual screen."); return false; }
 
                 // Eye images are copied from the backbuffer, so they match the game window's size.
                 CreateTextures(Screen.width, Screen.height);
@@ -80,6 +80,7 @@ namespace OlliVR
                 bool flip = Plugin.Cfg.FlipVertical.Value;
                 var bounds = new VRTextureBounds_t { uMin = 0, uMax = 1, vMin = flip ? 1 : 0, vMax = flip ? 0 : 1 };
 
+                if (VRSession.Headless) { Plugin.L.LogInfo($"Virtual screen (headless): {EyeWidth}x{EyeHeight} per eye."); return true; }
                 ulong screen = 0;
                 var err = ov.CreateOverlay("olliolliworld.vr.screen", "OlliOlli World 3D Screen", ref screen);
                 if (err != EVROverlayError.None) { Plugin.L.LogError("CreateOverlay (screen) failed: " + err); return false; }
@@ -201,6 +202,7 @@ namespace OlliVR
             if (!sizeChanged && !poseChanged) return;
 
             Center = center; Rotation = originRot; WidthMeters = w; HeightMeters = h;
+            if (VRSession.Headless) { placed = true; return; }
             var ov = VRSession.Overlay;
             if (sizeChanged) ov.SetOverlayWidthInMeters(VRSession.ScreenHandle, w);
             var m = VRSession.ToOpenVR(center, originRot);

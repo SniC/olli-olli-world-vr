@@ -323,6 +323,15 @@ namespace OlliVR
                 DrawScreenForCapture(rt, lastOriginPos, rot, proj, roomM, screenImage);
                 save(rt, System.IO.Path.Combine(dir, $"OlliVR_capture_Room{name}.png"));
             }
+            // Close-up of the floor lamp (debug).
+            {
+                var target = room.LampPos;
+                var eyeL = target + new Vector3(-0.75f, 0.1f, -0.75f);
+                var rotL = Quaternion.LookRotation(target - eyeL, Vector3.up);
+                var eyeW = roomM.MultiplyPoint3x4(eyeL);
+                RenderEye(rt, reflCap, eyeW, lastOriginRot * rotL, proj, roomM, lastOriginRot, lastFloorY, lastGlow, lastReflection, lastScreenImg, 0f, 0.5f);
+                save(rt, System.IO.Path.Combine(dir, "OlliVR_capture_RoomLamp.png"));
+            }
             rt.Release();
             reflCap.Release();
             Object.Destroy(reflCap);

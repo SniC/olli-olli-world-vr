@@ -7,6 +7,7 @@ namespace OlliVR
         public readonly ConfigEntry<bool> Enabled;
         public readonly ConfigEntry<bool> UncapFramerate;
         public readonly ConfigEntry<bool> VerboseLogging;
+        public readonly ConfigEntry<bool> HeadlessPreview;
 
         public readonly ConfigEntry<float> ScreenDistance;
         public readonly ConfigEntry<float> ScreenScale;
@@ -32,6 +33,9 @@ namespace OlliVR
             VerboseLogging = f.Bind("General", "VerboseLogging", false,
                 "Log camera dumps, render statistics and convergence distances. " +
                 "Creating BepInEx\\OlliVR_capture.trigger always saves the screen images as PNGs.");
+
+            HeadlessPreview = f.Bind("General", "HeadlessPreview", false,
+                "Development: if no headset is connected at start-up, run everything except SteamVR (fixed head pose) so the room, the 3D screen and the capture trigger work without a headset. Restart the game to use VR.");
 
             ScreenDistance = f.Bind("Screen", "ScreenDistance", 2.0f,
                 "Distance from you to the virtual screen, in metres.");

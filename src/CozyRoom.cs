@@ -50,6 +50,7 @@ namespace OlliVR
         float refSw = -1f, refSh = -1f;
         float cabTopY;
         public Part? TvPart;
+        public Vector3 LampPos;
 
         public void Build(float d, float screenCy, float sw, float sh, float floorY)
         {
@@ -73,6 +74,7 @@ namespace OlliVR
             var lampCol = new Color(1.0f, 0.60f, 0.28f) * 0.95f;
             float lampZ = ZFront - 0.35f;
             lights.Add(new PointLight { Pos = new Vector3(2.35f, F + 1.42f, lampZ), Col = lampCol, Radius = 1.1f, Lamp = true });
+            LampPos = new Vector3(2.35f, F + 1.42f, lampZ);
             var chandelierPos = new Vector3(0f, F + 2.75f, 0.2f);
             var chandelierSamples = new Vector3[8];
             for (int i = 0; i < 8; i++) { float a = i / 8f * Mathf.PI * 2f; chandelierSamples[i] = chandelierPos + new Vector3(Mathf.Cos(a) * 0.48f, 0.12f, Mathf.Sin(a) * 0.48f); }
@@ -325,12 +327,18 @@ namespace OlliVR
                 plain.Cylinder(basePos + new Vector3(0, 0.03f, 0), 0.015f, 0.015f, l.Pos.y - F - 0.03f, dark, 8);
                 var shadeBase = new Vector3(l.Pos.x, l.Pos.y - 0.17f, l.Pos.z);
                 // Outer fabric: only a faint glow through it.
-                plain.Cylinder(shadeBase, 0.22f, 0.20f, 0.34f, new Color(0.09f, 0.05f, 0.022f), 24, emissive: true, open: true);
+                // Outer fabric: lit from inside, a warm glow strongest at the height of the bulb, dimmer at the rims.
+                const int Bands = 20;
+                for (int band = 0; band < Bands; band++)
+                {
+                    float t0 = band / (float)Bands, t1 = (band + 1) / (float)Bands;
+                    float mid = 1f - Mathf.Abs((t0 + t1) / 2f - 0.5f) * 1.6f;
+                    var glowCol = new Color(0.46f, 0.25f, 0.09f) * (0.4f + 0.6f * mid * mid);
+                    plain.Cylinder(shadeBase + new Vector3(0, 0.34f * t0, 0), Mathf.Lerp(0.22f, 0.20f, t0), Mathf.Lerp(0.22f, 0.20f, t1), 0.34f / Bands, glowCol, 24, emissive: true, open: true);
+                }
                 // Bright inside, seen through the openings.
                 plain.Cylinder(shadeBase, 0.214f, 0.194f, 0.34f, new Color(1.0f, 0.82f, 0.55f), 24, emissive: true, open: true, inward: true);
                 plain.Sphere(l.Pos, 0.035f, new Color(1f, 0.95f, 0.85f), emissive: true);
-                Glows.Add((l.Pos + new Vector3(0, 0.19f, 0), 0.26f, new Color(0.12f, 0.08f, 0.035f), false));
-                Glows.Add((l.Pos - new Vector3(0, 0.19f, 0), 0.22f, new Color(0.10f, 0.065f, 0.03f), false));
             }
 
             // ---- river-stone chimney and fireplace (left wall) ----

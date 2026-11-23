@@ -90,6 +90,18 @@ namespace OlliVR
         }
         static ETrackedPropertyError _propErr;
 
+        /// <summary>No headset: everything runs except SteamVR (fixed eye setup, no submits). For debug captures.</summary>
+        public static bool Headless { get; private set; }
+
+        public static void EnterHeadless()
+        {
+            Headless = true;
+            EyeWidth = 2048; EyeHeight = 2048;
+            delegate* unmanaged<int, void> fp = &OnRenderEvent;   // returns early: not Ready
+            RenderEventFunc = (IntPtr)fp;
+            Plugin.L.LogInfo("Headless preview: no headset, rendering without SteamVR (debug captures work; restart the game to use VR).");
+        }
+
         public static void Shutdown()
         {
             if (!Ready) return;
@@ -107,6 +119,7 @@ namespace OlliVR
         public static bool GetPredictedHmdPose(out Vector3 pos, out Quaternion rot)
         {
             pos = Vector3.zero; rot = Quaternion.identity;
+            if (Headless) return false;
             float sinceVsync = 0; ulong frameCounter = 0;
             System.GetTimeSinceLastVsync(ref sinceVsync, ref frameCounter);
             // This frame is displayed roughly one frame after the render thread picks it up.
@@ -141,6 +154,7 @@ namespace OlliVR
 
         public static void PollEvents()
         {
+            if (Headless) return;
             var ev = new VREvent_t();
             uint size = (uint)Marshal.SizeOf<VREvent_t>();
             while (System.PollNextEvent(ref ev, size))
@@ -163,17 +177,22 @@ namespace OlliVR
         /// <summary>Eye position relative to the head (metres, Unity convention).</summary>
         public static Vector3 GetEyeOffset(EVREye eye)
         {
+            if (Headless) return new Vector3(eye == EVREye.Eye_Left ? -0.032f : 0.032f, 0, 0);
             ToUnity(System.GetEyeToHeadTransform(eye), out var pos, out _);
             return pos;
         }
 
         /// <summary>Full eye-to-head transform (some headsets have canted displays).</summary>
         public static void GetEyeToHead(EVREye eye, out Vector3 pos, out Quaternion rot)
-            => ToUnity(System.GetEyeToHeadTransform(eye), out pos, out rot);
+        {
+            if (Headless) { pos = GetEyeOffset(eye); rot = Quaternion.identity; return; }
+            ToUnity(System.GetEyeToHeadTransform(eye), out pos, out rot);
+        }
 
         /// <summary>The headset's own projection for an eye, as a Unity camera projection matrix.</summary>
         public static Matrix4x4 GetEyeProjection(EVREye eye, float near, float far)
         {
+            if (Headless) return Matrix4x4.Perspective(100f, 1f, near, far);
             var p = System.GetProjectionMatrix(eye, near, far);
             var m = new Matrix4x4();
             m.m00 = p.m0; m.m01 = p.m1; m.m02 = p.m2; m.m03 = p.m3;
@@ -186,6 +205,7 @@ namespace OlliVR
         /// <summary>Height of the seated zero pose above the floor, or 0 when unknown.</summary>
         public static float SeatedHeightAboveFloor()
         {
+            if (Headless) return 1.6f;
             try { return System.GetSeatedZeroPoseToStandingAbsoluteTrackingPose().m7; }
             catch { return 0f; }
         }

@@ -26,6 +26,7 @@ namespace OlliVR
 
         ScreenOverlays screen;
         Ambience ambience;
+        Vector3 lastHmdPos; Quaternion lastHmdRot = Quaternion.identity; bool havePose, poseMissingLogged;
         long ambienceTicks, ambienceMaxTicks, vrTicks, vrMaxTicks; int ambienceFrames; float nextAmbienceLog, maxDt;
         int gc0, gc1, gc2;
         bool initialized, failed, captureRequested;
@@ -69,7 +70,11 @@ namespace OlliVR
             // Retry so the headset can be connected after the game starts.
             if (Time.unscaledTime < nextInitAttempt) return false;
             nextInitAttempt = Time.unscaledTime + 5f;
-            if (!VRSession.Init(logFailure: !failed)) { failed = true; return false; }
+            if (!VRSession.Init(logFailure: !failed))
+            {
+                if (!Plugin.Cfg.HeadlessPreview.Value) { failed = true; return false; }
+                VRSession.EnterHeadless();
+            }
             if (failed) Plugin.L.LogInfo("OpenVR connected after retry.");
             VRSession.TraceBudget = 0;
 
@@ -215,7 +220,20 @@ namespace OlliVR
         /// </summary>
         void RenderAndSubmit()
         {
-            if (!VRSession.GetPredictedHmdPose(out var hmdPos, out var hmdRot)) return;
+            if (VRSession.GetPredictedHmdPose(out var hmdPos, out var hmdRot))
+            {
+                lastHmdPos = hmdPos; lastHmdRot = hmdRot; havePose = true;
+                if (poseMissingLogged) { poseMissingLogged = false; Plugin.L.LogInfo("Headset pose back."); }
+            }
+            else
+            {
+                // Headset idle or off: keep rendering from the last known head pose (or a default seated one),
+                // so the screen, the room and debug captures keep working without wearing it.
+                hmdPos = havePose ? lastHmdPos : Vector3.zero;
+                hmdRot = havePose ? lastHmdRot : Quaternion.identity;
+                VRSession.LastRenderPose = VRSession.ToOpenVR(hmdPos, hmdRot);
+                if (!poseMissingLogged) { poseMissingLogged = true; Plugin.L.LogInfo("No headset pose (idle?): rendering from the last known pose."); }
+            }
 
             if (!haveOrigin)
             {
