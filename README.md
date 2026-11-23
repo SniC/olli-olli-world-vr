@@ -5,7 +5,7 @@ A BepInEx 6 (IL2CPP) plugin that shows OlliOlli World on a big stereoscopic 3D v
 ## How it works
 - The game keeps its cameras disabled and renders them by hand. The mod notes, through `Camera.onPreCull`, which cameras actually rendered to the monitor each frame.
 - At the end of each frame, it renders those cameras again, once per eye, with a generalised off-axis projection. Each eye's real position (from SteamVR) looks through the screen rectangle. The screen maps to the game's image plane at the **convergence distance**, so objects there sit on the screen surface: nearer things pop out and farther things recede.
-- The screen size and window come from the game camera's actual projection matrix. The game zooms and shifts the view with a custom projection, which is why the skater sits left of centre. From the normal viewing position, the image is identical to the flat game.
+- The screen size and window come from the game camera's actual projection. Cinemachine frames the skater left of centre with `Camera.lensShift`, which the mod applies to the eye window as well. Each eye renders at the game window's resolution. From the normal viewing position, the image is identical to the flat game.
 - The game uses its own scriptable render pipeline (`Roll7.NoComplyRenderer`). One property shapes the whole design: a camera render does **not** draw on top of its target. It renders into internal textures and replaces the whole target, and transparency is lost. So nothing can be drawn over an eye image afterwards.
 - The game's screen-space UI (menus, HUD, dialogue bubbles) stays in overlay-equivalent layout on the mod's own orthographic UI camera. Game code positions UI in screen pixels, and the "gloop" blob effect needs that too. Each eye image is placed as a full-screen background behind the UI on that camera, so one UI render produces "eye + UI", composited by the game's own UI path. The UI sits on the screen surface.
 - Each eye renders to its own texture. Both are copied into one side-by-side texture, alpha is forced opaque, and it's shown on a SteamVR overlay with the `SideBySide_Parallel` flag.
@@ -28,9 +28,8 @@ A BepInEx 6 (IL2CPP) plugin that shows OlliOlli World on a big stereoscopic 3D v
 | `ScreenDistance` | 2.0 | Distance to the screen in metres. |
 | `ScreenScale` | 1.0 | Screen size. At 1.0 the screen covers the game camera's FOV exactly. |
 | `ScreenHeightOffset` | 0 | Raise or lower the screen (metres). |
-| `ScreenResolution` | 1080 | Per-eye vertical resolution. |
 | `DepthStrength` | 1.0 | Eye separation multiplier. Higher means deeper 3D; 0 is flat. |
-| `ConvergenceDistance` | 0 (auto) | Game-world distance that sits on the screen surface. Auto uses a raycast through the view centre and the Cinemachine target. |
+| `ConvergenceDistance` | 0 (auto) | Game-world distance that sits on the screen surface. Auto follows the skater's distance, with a raycast through the view centre as fallback. |
 | `HeadCoupled` | 1.0 | Fish-tank effect strength. 0 gives a fixed viewpoint. |
 | `FlipVertical` | true | Toggle if the screen is upside down. |
 | `VerboseLogging` | false | Camera, render and convergence diagnostics. |
