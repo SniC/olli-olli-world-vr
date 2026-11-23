@@ -9,8 +9,11 @@ A BepInEx 6 (IL2CPP) mod that puts **OlliOlli World** on a big stereoscopic 3D v
 - **Look into the world.** Lean or move your head and the view shifts, as if the screen were a window into the game.
 - **Steady depth.** Your skater always sits on the screen surface, so the 3D stays comfortable at speed.
 - **A big screen in front of you.** Recenter any time with L3 + R3. Size, distance and depth strength are adjustable.
+- **A cozy log cabin to play in.** The screen is a TV in a wooden lodge on a snowy night: a crackling fireplace, candles and fairy lights, a window onto moonlit mountains. The TV glows onto the wall behind it and lights the room in the colours of the game.
 
 <p align="center"><img src="docs/side-by-side.jpg" alt="Side-by-side stereo image as sent to the headset"><br><sub>The side-by-side image the headset receives (left eye, right eye).</sub></p>
+
+<p align="center"><img src="docs/lodge.jpg" alt="The lodge around the TV: stone fireplace, garland, armchair"><br><sub>The lodge around the screen.</sub></p>
 
 ## Requirements
 - OlliOlli World on Steam (Windows).
@@ -47,8 +50,8 @@ The zip includes an unmodified [BepInEx](https://github.com/BepInEx/BepInEx) 6.0
 | `DepthStrength` | 1.0 | Eye separation multiplier. Higher gives deeper 3D, 0 is flat. |
 | `ConvergenceDistance` | 0 (auto) | Game-world distance that sits on the screen surface. Auto follows the skater, with a raycast through the view centre as fallback. |
 | `HeadCoupled` | 1.0 | Fish-tank effect strength. 0 gives a fixed viewpoint, like a plain 3D TV. |
-| `AmbientGlow` | 1.0 | Brightness of the glow the screen casts on the wall and floor around it. 0 gives a dark room. |
-| `FloorReflection` | 0.12 | Strength of the screen's blurred reflection in the floor. 0 turns it off. |
+| `AmbientGlow` | 1.0 | Strength of the TV's light: the glow on the wall behind it and the light it throws into the room. 0 turns it off. |
+| `FloorReflection` | 0.2 | How glossy the varnished floor is (reflections of the room and the TV). 0 gives a matte floor. |
 | `UncapFramerate` | true | Turns off the game's vsync and frame cap so SteamVR paces the frames. |
 | `ReplaceTAA` | true | Replaces TAA with FXAA. |
 | `DisabledEffects` | MotionBlur | Comma-separated post-processing effects to turn off, for example `MotionBlur,DepthOfField,Vignette`. |
@@ -59,7 +62,8 @@ The zip includes an unmodified [BepInEx](https://github.com/BepInEx/BepInEx) 6.0
 - **Nothing in the headset:** check `BepInEx\LogOutput.log` for lines starting with `OlliVR`. The mod keeps retrying to connect to SteamVR every few seconds, so starting SteamVR after the game also works.
 - **Screen in the wrong place:** recenter with F8, or hold L3 + R3.
 - **Too much or too little depth:** lower or raise `DepthStrength`. If the fish-tank effect feels uncomfortable, set `HeadCoupled` to 0.
-- **Screenshots for bug reports:** create an empty file `BepInEx\OlliVR_capture.trigger`. The mod saves `BepInEx\OlliVR_capture_Stereo.png` within a second.
+- **Screenshots for bug reports:** create an empty file `BepInEx\OlliVR_capture.trigger`. The mod saves `BepInEx\OlliVR_capture_Stereo.png` within a second, plus views of the room (`OlliVR_capture_Room*.png`).
+- **A short stutter when the room appears:** the lodge is built and its lighting baked once (about two seconds, mostly in the background). It only happens again if the screen size or distance changes.
 
 ## Known issues
 - Some shadows shimmer slightly in the headset.
@@ -69,7 +73,8 @@ The zip includes an unmodified [BepInEx](https://github.com/BepInEx/BepInEx) 6.0
 - At the end of each frame it renders those cameras again, once per eye. Each eye gets a generalised off-axis projection: the eye's real position, from SteamVR, looks through the screen rectangle. The screen maps to the game's image plane at the convergence distance, so objects at that distance sit on the screen surface.
 - The screen's size and window come from the game camera's actual projection. Cinemachine frames the skater left of centre with `Camera.lensShift`, and the mod applies that shift to each eye's window as well.
 - The game uses its own scriptable render pipeline (`Roll7.NoComplyRenderer`). A camera render there replaces its whole target and drops alpha, so nothing can be drawn over an eye image afterwards. Instead, the game's screen-space UI moves to the mod's orthographic UI camera, laid out exactly like overlay mode. Each eye image is placed as a full-screen background behind the UI, so a single UI render produces "eye + UI".
-- Both eyes are combined into one side-by-side texture and shown on a SteamVR overlay with the `SideBySide_Parallel` flag. A dark backdrop is submitted as the scene, with frame pacing on Unity's render thread so the game never blocks on SteamVR.
+- Both eyes are combined into one side-by-side texture and shown on a SteamVR overlay with the `SideBySide_Parallel` flag. The lodge is submitted as the scene layer behind it, with frame pacing on Unity's render thread so the game never blocks on SteamVR.
+- The lodge is generated in code: geometry from boards, logs, rounded boxes and displaced stone, and textures from noise with baked relief (on a worker thread). Its lighting is baked per vertex by a small CPU ray tracer: soft shadows from area lights, ambient occlusion, the fire seen through its opening, and the TV screen as a light whose colour is applied live. Only shaders that ship with the game can be used, so the depth pass, additive light and the multiplied TV glow are built from `Hidden/Internal-Colored`, `UI/Default` and `Particles/Standard Unlit`. The glossy floor is a blurred, mirrored render of the room.
 
 ## Uninstall
 Delete `BepInEx\plugins\OlliVR`. To remove BepInEx completely, also delete `winhttp.dll` from the game folder.
