@@ -26,7 +26,8 @@ namespace OlliVR
 
         ScreenOverlays screen;
         Ambience ambience;
-        long ambienceTicks; int ambienceFrames; float nextAmbienceLog;
+        long ambienceTicks, ambienceMaxTicks, vrTicks, vrMaxTicks; int ambienceFrames; float nextAmbienceLog, maxDt;
+        int gc0, gc1, gc2;
         bool initialized, failed, captureRequested;
         float nextInitAttempt;
         const int UILayerMask = 1 << 5;
@@ -192,8 +193,12 @@ namespace OlliVR
             {
                 yield return eof;
                 if (!initialized) continue;
+                long vr0 = System.Diagnostics.Stopwatch.GetTimestamp();
                 try { RenderAndSubmit(); }
                 catch (Exception e) { Plugin.L.LogError("VR frame error: " + e); }
+                long vrDt = System.Diagnostics.Stopwatch.GetTimestamp() - vr0;
+                vrTicks += vrDt;
+                if (vrDt > vrMaxTicks) vrMaxTicks = vrDt;
             }
         }
 
@@ -285,13 +290,20 @@ namespace OlliVR
             long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
             ambience.UpdateGlow(screen.EyeLeft);
             ambience.Render(hmdPos, hmdRot, originPos, originRot, screen);
-            ambienceTicks += System.Diagnostics.Stopwatch.GetTimestamp() - t0;
+            long dtA = System.Diagnostics.Stopwatch.GetTimestamp() - t0;
+            ambienceTicks += dtA;
+            if (dtA > ambienceMaxTicks) ambienceMaxTicks = dtA;
+            if (Time.unscaledDeltaTime > maxDt) maxDt = Time.unscaledDeltaTime;
             ambienceFrames++;
             if (Time.unscaledTime >= nextAmbienceLog)
             {
                 nextAmbienceLog = Time.unscaledTime + 10f;
                 double ms = ambienceTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency / Math.Max(1, ambienceFrames);
-                Plugin.L.LogInfo($"Ambience CPU: {ms:0.000} ms/frame over {ambienceFrames} frames");
+                double tk = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                int g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1), g2 = GC.CollectionCount(2);
+                Plugin.L.LogInfo($"Ambience CPU: {ms:0.000} ms/frame (max {ambienceMaxTicks * tk:0.0}) over {ambienceFrames} frames; VR frame {vrTicks * tk / Math.Max(1, ambienceFrames):0.00} ms (max {vrMaxTicks * tk:0.0}); " +
+                                 $"worst frame interval {maxDt * 1000f:0.0} ms; GC gen0/1/2 +{g0 - gc0}/+{g1 - gc1}/+{g2 - gc2}");
+                gc0 = g0; gc1 = g1; gc2 = g2; ambienceMaxTicks = 0; vrTicks = 0; vrMaxTicks = 0; maxDt = 0;
                 ambienceTicks = 0; ambienceFrames = 0;
             }
 

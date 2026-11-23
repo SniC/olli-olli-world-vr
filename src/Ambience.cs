@@ -233,6 +233,9 @@ namespace OlliVR
 
         Vector4 roomKey = new(float.NaN, 0, 0, 0);
         float roomKey2 = float.NaN, roomKey3 = float.NaN;
+        bool roomBuilt;
+        Vector2 tvSize;
+        float glowDirtyAt = -1f;
         Mesh glowMesh;
         float fireIntensity = 1f, fireTarget = 1f, nextFireChange;
 
@@ -260,12 +263,28 @@ namespace OlliVR
             float sw = screen.WidthMeters, sh = screen.HeightMeters;
             if (sw <= 0f || sh <= 0f) return;
 
-            var key = new Vector4(c.y, c.z, sw, sh);
-            if (glowMesh == null || key != roomKey || !Mathf.Approximately(floorY, roomKey2) || !Mathf.Approximately(glow, roomKey3))
+            // The baked room only depends on the screen distance/height and the floor; the TV follows the screen
+            // size (the game's field of view) on its own, and the glow mesh once that size has settled.
+            var key = new Vector4(c.y, c.z, floorY, 0f);
+            // Recentering moves the head a few millimetres; only rebuild for a real change of floor height.
+            if (!roomBuilt || key.x != roomKey.x || key.y != roomKey.y || Mathf.Abs(key.z - roomKey.z) > 0.05f)
             {
-                roomKey = key; roomKey2 = floorY; roomKey3 = glow;
+                roomKey = key; roomBuilt = true;
                 room.Build(d, c.y, sw, sh, floorY);
+                tvSize = Vector2.zero;
+            }
+            if (Mathf.Abs(sw - tvSize.x) > 0.004f || Mathf.Abs(sh - tvSize.y) > 0.004f)
+            {
+                tvSize = new Vector2(sw, sh);
+                room.BuildTv(d, c.y, sw, sh);
+                glowDirtyAt = Time.unscaledTime;
+            }
+            if (glowMesh == null || (glowDirtyAt >= 0f && Time.unscaledTime - glowDirtyAt > 0.4f) || !Mathf.Approximately(glow, roomKey3))
+            {
+                glowDirtyAt = -1f; roomKey3 = glow;
+                var sw0 = System.Diagnostics.Stopwatch.StartNew();
                 BuildGlowMesh(c, sw, sh, glow);
+                if (Plugin.Cfg.VerboseLogging.Value) Plugin.L.LogInfo($"Glow mesh rebuilt in {sw0.ElapsedMilliseconds} ms");
             }
 
             room.TryFinish();
@@ -411,6 +430,15 @@ namespace OlliVR
                 texMatZ.mainTexture = part.Tex;
                 texMatZ.SetPass(0);
                 Graphics.DrawMeshNow(part.Mesh, model);
+            }
+            // The TV around the screen (not baked: it follows the screen size).
+            if (room.TvPart.HasValue)
+            {
+                depthMat.SetPass(0);
+                Graphics.DrawMeshNow(room.TvPart.Value.Mesh, model);
+                texMatZ.mainTexture = room.TvPart.Value.Tex;
+                texMatZ.SetPass(0);
+                Graphics.DrawMeshNow(room.TvPart.Value.Mesh, model);
             }
 
             // Fire light flickering over the room.

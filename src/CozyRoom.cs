@@ -46,8 +46,15 @@ namespace OlliVR
         readonly List<PointLight> lights = new();
         PointLight fire;
 
+        // The room layout uses the screen size seen at the first build; later size changes only move the TV.
+        float refSw = -1f, refSh = -1f;
+        float cabTopY;
+        public Part? TvPart;
+
         public void Build(float d, float screenCy, float sw, float sh, float floorY)
         {
+            if (refSw < 0f) { refSw = sw; refSh = sh; }
+            sw = refSw; sh = refSh;
             // Opaque meshes and the fire light are replaced when the new lighting bake finishes (TryFinish).
             foreach (var p in Outside) Object.Destroy(p.Mesh);
             Outside.Clear();
@@ -224,10 +231,9 @@ namespace OlliVR
             var tvBlack = new Color(0.05f, 0.05f, 0.06f);
             const float Bezel = 0.03f;
             float tvZ = d + 0.03f;   // bezel front just behind the screen plane
-            plain.Box(new Vector3(0, screenCy, tvZ), new Vector3(sw + 2 * Bezel, sh + 2 * Bezel, 0.05f), tvBlack);
-            plain.Box(new Vector3(0, screenCy, d + 0.075f), new Vector3(sw * 0.6f, sh * 0.6f, 0.05f), tvBlack * 0.8f);
-            plain.Box(new Vector3(sw / 2 - 0.05f, screenBottom - Bezel * 0.5f, d + 0.004f), new Vector3(0.008f, 0.004f, 0.002f),
-                      new Color(0.9f, 0.35f, 0.25f) * 0.6f, emissive: true); // standby LED
+            // The TV itself (bezel, back, LED, stand) is built separately in BuildTv, so a change of the game's
+            // field of view (screen size) only rebuilds the TV, not the whole baked room. Here: its shadow volume.
+            AddOcc(new Vector3(0, screenCy, tvZ + 0.01f), new Vector3(sw + 2 * Bezel, sh + 2 * Bezel, 0.07f));
 
             // ---- TV cabinet: legs, open compartments, a door, books inside, a console ----
             var cabCol = new Color(0.80f, 0.60f, 0.42f);
@@ -287,9 +293,7 @@ namespace OlliVR
             }
 
             // ---- TV stand on the cabinet ----
-            float neckTop = screenBottom - Bezel, neckZ = d + 0.07f;
-            plain.Box(new Vector3(0, (y1 + neckTop) / 2, neckZ), new Vector3(0.08f, neckTop - y1, 0.035f), tvBlack * 1.3f);
-            plain.Box(new Vector3(0, y1 + 0.008f, neckZ - 0.02f), new Vector3(0.42f, 0.016f, 0.22f), tvBlack * 1.3f);
+            cabTopY = y1;
 
             // ---- snake plant on the floor left of the cabinet (anything in front of the screen would be hidden by it) ----
             var potPos = new Vector3(-hw - 0.32f, F, cabZ - 0.05f);
@@ -612,6 +616,31 @@ namespace OlliVR
             // Lighting is ray traced on worker threads; the previous meshes stay visible until it finishes.
             floorB.Alpha = 1f - Mathf.Clamp01(Plugin.Cfg.FloorReflection.Value);
             StartBake(new[] { floorB, boards, wood, logs, plain, rug, stone, plaid, deck, leather, sheep, painting, sky });
+        }
+
+        /// <summary>
+        /// The TV around the current screen size: bezel, back, standby LED and a stand down to the cabinet.
+        /// Cheap (no light bake: it is black plastic, lit with fixed colours), so it can follow the game's field
+        /// of view without rebuilding the room.
+        /// </summary>
+        public void BuildTv(float d, float screenCy, float sw, float sh)
+        {
+            if (TvPart.HasValue) Object.Destroy(TvPart.Value.Mesh);
+            var tv = new MeshBuilder(this, RoomTextures.White);
+            bool rec = recordOcc; recordOcc = false;
+            var tvBlack = new Color(0.008f, 0.008f, 0.009f);   // unlit: final colour, so near black
+            const float Bezel = 0.03f;
+            float screenBottom = screenCy - sh / 2;
+            tv.Box(new Vector3(0, screenCy, d + 0.03f), new Vector3(sw + 2 * Bezel, sh + 2 * Bezel, 0.05f), tvBlack);
+            tv.Box(new Vector3(0, screenCy, d + 0.075f), new Vector3(sw * 0.6f, sh * 0.6f, 0.05f), tvBlack * 0.8f);
+            tv.Box(new Vector3(sw / 2 - 0.05f, screenBottom - Bezel * 0.5f, d + 0.004f), new Vector3(0.008f, 0.004f, 0.002f),
+                   new Color(0.9f, 0.35f, 0.25f) * 0.6f, emissive: true);
+            float neckTop = screenBottom - Bezel, neckZ = d + 0.07f;
+            if (neckTop > cabTopY + 0.02f)
+                tv.Box(new Vector3(0, (cabTopY + neckTop) / 2, neckZ), new Vector3(0.08f, neckTop - cabTopY, 0.035f), tvBlack * 1.8f);
+            tv.Box(new Vector3(0, cabTopY + 0.008f, neckZ - 0.02f), new Vector3(0.42f, 0.016f, 0.22f), tvBlack * 1.8f);
+            recordOcc = rec;
+            TvPart = new Part { Mesh = tv.ToMeshUnlit(), Tex = tv.Tex };
         }
 
         /// <summary>A flat scenery layer outside the right window (facing the room), emissive.</summary>
