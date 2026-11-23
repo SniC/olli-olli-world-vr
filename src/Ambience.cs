@@ -24,12 +24,16 @@ namespace OlliVR
 
         static readonly Color ClearColor = new(0.02f, 0.02f, 0.026f, 1f);
         const float GlowFalloff = 0.28f;   // metres for the glow to drop to ~37%: concentrated behind the TV
+        const float GlowLitGain = 3.2f;    // multiplicative glow gain (surface * (1 + gain * glow)) per pass
+        const int GlowLitPasses = 3;
+        const float TvLightGain = 3.0f;    // light the TV screen throws into the room, per pass (two passes)
         const float GlowBoost = 1.25f;     // colour gain on the glow (the source is an average, so it reads dim)
 
         readonly CozyRoom room = new();
-        RenderTexture mipSource, glowRaw, glowSmooth, msaaL, msaaR, reflL, reflR;
-        Material depthMat, texMat, texMatZ, glowMat, addMat;
+        RenderTexture mipSource, glowRaw, glowSmooth, msaaL, msaaR, reflL, reflR, avgRaw, avgSmooth;
+        Material depthMat, texMat, texMatZ, glowMat, addMat, glowLitMat, tvMat;
         bool glowAdditive;
+        int glowPass;
         Matrix4x4 projL, projR;
         Vector3 eyePosL, eyePosR;
         Quaternion eyeRotL = Quaternion.identity, eyeRotR = Quaternion.identity;
@@ -58,9 +62,14 @@ namespace OlliVR
             mipSource = MakeRT("OlliVR_GlowMips", 256, 144, true, 0);
             glowRaw = MakeRT("OlliVR_GlowRaw", 24, 14, false, 0);
             glowSmooth = MakeRT("OlliVR_Glow", 24, 14, false, 0);
+            // The screen's average colour (a 1x1 texture), for the light the TV throws into the room.
+            avgRaw = MakeRT("OlliVR_ScreenAvgRaw", 1, 1, false, 0);
+            avgSmooth = MakeRT("OlliVR_ScreenAvg", 1, 1, false, 0);
+            Clear(avgSmooth, Color.black);
             Clear(glowSmooth, Color.black);
             mipSource.mipMapBias = 1.5f;
 
+            LogShaders();
             var colored = Shader.Find("Hidden/Internal-Colored");
             var textured = Shader.Find("UI/Default");
             if (colored == null || textured == null)
@@ -77,13 +86,39 @@ namespace OlliVR
             texMatZ = TexturedMat(textured, CompareFunction.LessEqual);
 
             // An additive textured shader makes the screen glow add light instead of tinting; fall back otherwise.
-            var additive = Shader.Find("Legacy Shaders/Particles/Additive") ?? Shader.Find("Mobile/Particles/Additive");
-            if (additive != null)
+            // Additive textured light: Particles/Standard Unlit has configurable blending, so light is added on
+            // top of the surfaces (their texture stays visible) instead of tinting them.
+            var particles = Shader.Find("Particles/Standard Unlit");
+            if (particles != null)
             {
-                glowMat = new Material(additive) { hideFlags = HideFlags.HideAndDontSave };
-                glowMat.SetColor("_TintColor", new Color(0.5f, 0.5f, 0.5f, 0.5f));
+                glowMat = new Material(particles) { hideFlags = HideFlags.HideAndDontSave };
+                glowMat.SetInt("_SrcBlend", (int)BlendMode.One);
+                glowMat.SetInt("_DstBlend", (int)BlendMode.One);
+                glowMat.SetInt("_ZWrite", 0);
+                glowMat.SetInt("_Cull", (int)CullMode.Off);
+                glowMat.color = Color.white;
                 Object.DontDestroyOnLoad(glowMat);
                 glowAdditive = true;
+                // The shader's first passes are shadow caster / scene picking; the colour pass is the last one.
+                glowPass = glowMat.passCount - 1;
+                glowLitMat = new Material(particles) { hideFlags = HideFlags.HideAndDontSave };
+                glowLitMat.SetInt("_SrcBlend", (int)BlendMode.DstColor);
+                glowLitMat.SetInt("_DstBlend", (int)BlendMode.One);
+                glowLitMat.SetInt("_ZWrite", 0);
+                glowLitMat.SetInt("_Cull", (int)CullMode.Off);
+                // Gain: the wall is dimly lit, so the light the glow adds is large relative to what is there.
+                glowLitMat.color = new Color(GlowLitGain, GlowLitGain, GlowLitGain, 1f);
+                Object.DontDestroyOnLoad(glowLitMat);
+                tvMat = new Material(particles) { hideFlags = HideFlags.HideAndDontSave };
+                tvMat.SetInt("_SrcBlend", (int)BlendMode.DstColor);
+                tvMat.SetInt("_DstBlend", (int)BlendMode.One);
+                tvMat.SetInt("_ZWrite", 0);
+                tvMat.SetInt("_Cull", (int)CullMode.Off);
+                tvMat.color = new Color(TvLightGain, TvLightGain, TvLightGain, 1f);
+                Object.DontDestroyOnLoad(tvMat);
+                var passNames = new System.Collections.Generic.List<string>();
+                for (int i = 0; i < glowMat.passCount; i++) passNames.Add(glowMat.GetPassName(i));
+                Plugin.L.LogInfo($"Additive light shader passes: {string.Join(", ", passNames)} (using {glowPass})");
             }
             else
             {
@@ -106,6 +141,20 @@ namespace OlliVR
             Plugin.L.LogInfo($"Ambience ready: {w}x{h} per eye, seated height {seatedHeight:0.00} m, " +
                              $"glow {(glowAdditive ? "additive" : "blended")}.");
             return true;
+        }
+
+        /// <summary>Diagnostics: which shaders this build has (we can only use what the game ships).</summary>
+        static void LogShaders()
+        {
+            try
+            {
+                var names = new System.Collections.Generic.SortedSet<string>();
+                foreach (var o in Resources.FindObjectsOfTypeAll(Il2CppInterop.Runtime.Il2CppType.Of<Shader>())) names.Add(o.name);
+                foreach (var n in new[] { "Hidden/Internal-Halo", "Hidden/Internal-Flare", "Hidden/Internal-GUITexture", "Hidden/Internal-GUITextureClip", "Hidden/BlitCopy", "Unlit/Texture", "Unlit/Transparent", "Legacy Shaders/Particles/Additive", "Particles/Standard Unlit", "Sprites/Default" })
+                    if (Shader.Find(n) != null) names.Add("[find] " + n);
+                Plugin.L.LogInfo("Shaders available: " + string.Join(" | ", names));
+            }
+            catch (System.Exception e) { Plugin.L.LogWarning("Shader list failed: " + e.Message); }
         }
 
         static Material ColoredMat(Shader s, BlendMode src, BlendMode dst, bool zWrite, CompareFunction zTest)
@@ -157,6 +206,8 @@ namespace OlliVR
             Graphics.Blit(mipSource, glowRaw);       // minified blit samples a low mip: a soft average
             float k = 1f - Mathf.Exp(-Time.unscaledDeltaTime * 10f);
             DrawFullscreen(glowRaw, glowSmooth, k);
+            Graphics.Blit(mipSource, avgRaw);        // a 1x1 target samples the smallest mips: the average
+            DrawFullscreen(avgRaw, avgSmooth, 1f - Mathf.Exp(-Time.unscaledDeltaTime * 6f));
         }
 
         void DrawFullscreen(Texture src, RenderTexture dst, float alpha)
@@ -378,12 +429,35 @@ namespace OlliVR
                 Graphics.DrawMeshNow(room.Outside[i].Mesh, model);
             }
 
+            // Light from the front of the TV: baked "how much of the screen each point sees" times the screen's
+            // live average colour, multiplied onto the surfaces (two passes for range, as for the glow).
+            if (glow > 0f && tvMat != null && room.TvLight != null)
+            {
+                tvMat.color = new Color(TvLightGain * glow, TvLightGain * glow, TvLightGain * glow, 1f);
+                tvMat.mainTexture = avgSmooth;
+                for (int pass = 0; pass < 2; pass++)
+                {
+                    tvMat.SetPass(glowPass);
+                    Graphics.DrawMeshNow(room.TvLight, model);
+                }
+            }
+
             // Screen glow on the wall behind it and the floor.
             if (glow > 0f && glowMesh != null)
             {
-                glowMat.mainTexture = glowSmooth;
-                glowMat.SetPass(0);
-                Graphics.DrawMeshNow(glowMesh, model);
+                // Light falling on a surface is multiplied by its colour: blend DstColor/One gives
+                // surface * (1 + glow), so the glow takes on the wood colour and grain instead of a flat haze.
+                var gm = glowLitMat ?? glowMat;
+                gm.mainTexture = glowSmooth;
+                gm.SetPass(glowPass);
+                // The blend clamps the light to 1 per pass (at most 2x); repeating it (up to 8x) lets the screen
+                // outshine the dim room light near the TV as it would.
+                int passes = gm == glowLitMat ? GlowLitPasses : 1;
+                for (int pass = 0; pass < passes; pass++)
+                {
+                    if (pass > 0) gm.SetPass(glowPass);
+                    Graphics.DrawMeshNow(glowMesh, model);
+                }
             }
 
             GL.modelview = view * model;
@@ -394,7 +468,7 @@ namespace OlliVR
             if (main)
             {
                 DrawSparks(camRight, camUp);
-                DrawHalos(view, model, eyeLocal);
+                DrawHalos(view, model, eyeLocal, camRight, camUp);
             }
         }
 
@@ -420,59 +494,65 @@ namespace OlliVR
         static System.Numerics.Vector3 N3(Vector3 v) => new(v.x, v.y, v.z);
         static void Vtx(System.Numerics.Vector3 v) => GL.Vertex3(v.X, v.Y, v.Z);
 
-        Mesh haloMesh;
-
-        /// <summary>A unit disc facing +z: bright centre, soft falloff to a black (no-op when added) rim.</summary>
-        Mesh HaloMesh()
-        {
-            if (haloMesh != null) return haloMesh;
-            const int Seg = 20;
-            var v = new Vector3[1 + Seg * 2];
-            var c = new Color[v.Length];
-            var t = new int[Seg * 9];
-            v[0] = Vector3.zero; c[0] = Color.white;
-            for (int i = 0; i < Seg; i++)
-            {
-                float a = i / (float)Seg * Mathf.PI * 2f;
-                float x = Mathf.Cos(a), y = Mathf.Sin(a);
-                v[1 + i] = new Vector3(x * 0.3f, y * 0.3f, 0); c[1 + i] = new Color(0.28f, 0.28f, 0.28f, 1f);
-                v[1 + Seg + i] = new Vector3(x, y, 0); c[1 + Seg + i] = Color.black;
-            }
-            for (int i = 0; i < Seg; i++)
-            {
-                int i0 = 1 + i, i1 = 1 + (i + 1) % Seg, o0 = 1 + Seg + i, o1 = 1 + Seg + (i + 1) % Seg, k = i * 9;
-                t[k] = 0; t[k + 1] = i0; t[k + 2] = i1;
-                t[k + 3] = i0; t[k + 4] = o0; t[k + 5] = o1;
-                t[k + 6] = i0; t[k + 7] = o1; t[k + 8] = i1;
-            }
-            haloMesh = new Mesh { name = "OlliVR_Halo", hideFlags = HideFlags.HideAndDontSave };
-            haloMesh.vertices = v; haloMesh.colors = c; haloMesh.triangles = t;
-            haloMesh.UploadMeshData(true);
-            Object.DontDestroyOnLoad(haloMesh);
-            return haloMesh;
-        }
+        Mesh haloBatch;
+        Vector3[] haloV;
+        Color[] haloC;
 
         /// <summary>
-        /// Soft additive halos around light sources (a cheap stand-in for bloom): one prebuilt disc per light,
-        /// facing the eye and pulled slightly towards it so it does not clip into the surface behind.
+        /// Soft additive halos around light sources (a cheap stand-in for bloom). All of them are camera-facing
+        /// quads with a radial falloff texture in one dynamic mesh, drawn with a single call per eye.
         /// </summary>
-        void DrawHalos(Matrix4x4 view, Matrix4x4 model, Vector3 eyeLocal)
+        void DrawHalos(Matrix4x4 view, Matrix4x4 model, Vector3 eyeLocal, Vector3 rightU, Vector3 upU)
         {
-            if (room.Glows.Count == 0) return;
-            var mesh = HaloMesh();
-            GL.modelview = view;
-            var eye = N3(eyeLocal);
-            foreach (var g in room.Glows)
+            int n = room.Glows.Count;
+            if (n == 0) return;
+            if (haloBatch == null || haloV.Length != n * 4)
             {
+                if (haloBatch == null)
+                {
+                    haloBatch = new Mesh { name = "OlliVR_Halos", hideFlags = HideFlags.HideAndDontSave };
+                    haloBatch.MarkDynamic();
+                    Object.DontDestroyOnLoad(haloBatch);
+                }
+                haloBatch.Clear();
+                haloV = new Vector3[n * 4];
+                haloC = new Color[n * 4];
+                var uv = new Vector2[n * 4];
+                var tri = new int[n * 6];
+                for (int i = 0; i < n; i++)
+                {
+                    uv[i * 4] = new Vector2(0, 0); uv[i * 4 + 1] = new Vector2(0, 1); uv[i * 4 + 2] = new Vector2(1, 1); uv[i * 4 + 3] = new Vector2(1, 0);
+                    tri[i * 6] = i * 4; tri[i * 6 + 1] = i * 4 + 1; tri[i * 6 + 2] = i * 4 + 2;
+                    tri[i * 6 + 3] = i * 4; tri[i * 6 + 4] = i * 4 + 2; tri[i * 6 + 5] = i * 4 + 3;
+                }
+                haloBatch.vertices = haloV; haloBatch.uv = uv; haloBatch.colors = haloC; haloBatch.triangles = tri;
+                haloBatch.bounds = new Bounds(Vector3.zero, Vector3.one * 1000f);
+            }
+            var eye = N3(eyeLocal);
+            var right = N3(rightU); var up = N3(upU);
+            for (int i = 0; i < n; i++)
+            {
+                var g = room.Glows[i];
                 float k = g.fire ? fireIntensity : 1f;
                 var p = N3(g.pos);
                 var toEye = System.Numerics.Vector3.Normalize(eye - p);
                 var c = p + toEye * System.MathF.Min(g.radius * 0.8f, 0.25f);
-                addMat.color = g.colour * k;
-                addMat.SetPass(0);
-                var rot = Quaternion.LookRotation(new Vector3(toEye.X, toEye.Y, toEye.Z));
-                Graphics.DrawMeshNow(mesh, model * Matrix4x4.TRS(new Vector3(c.X, c.Y, c.Z), rot, new Vector3(g.radius, g.radius, g.radius)));
+                var r = right * g.radius; var u = up * g.radius;
+                var a = c - r - u; var b = c - r + u; var d = c + r + u; var e = c + r - u;
+                haloV[i * 4] = new Vector3(a.X, a.Y, a.Z); haloV[i * 4 + 1] = new Vector3(b.X, b.Y, b.Z);
+                haloV[i * 4 + 2] = new Vector3(d.X, d.Y, d.Z); haloV[i * 4 + 3] = new Vector3(e.X, e.Y, e.Z);
+                var col = g.colour * (k * 2.2f);
+                col.a = 1f;
+                haloC[i * 4] = col; haloC[i * 4 + 1] = col; haloC[i * 4 + 2] = col; haloC[i * 4 + 3] = col;
             }
+            haloBatch.vertices = haloV;
+            haloBatch.colors = haloC;
+            var m = glowAdditive ? glowMat : addMat;
+            m.mainTexture = RoomTextures.Halo;
+            if (m == addMat) m.color = Color.white;
+            m.SetPass(m == glowMat ? glowPass : 0);
+            GL.modelview = view;
+            Graphics.DrawMeshNow(haloBatch, model);
         }
 
         struct Spark { public System.Numerics.Vector3 P, V; public float Age, Life; }
@@ -527,7 +607,7 @@ namespace OlliVR
             if (room.Candles.Count == 0) return;
             var m = glowAdditive ? glowMat : texMatZ;
             m.mainTexture = RoomTextures.Flames;
-            m.SetPass(0);
+            m.SetPass(m == glowMat ? glowPass : 0);
             float t = Time.unscaledTime;
             var eye = N3(eyeLocalU);
             GL.Begin(GL.QUADS);
@@ -560,7 +640,7 @@ namespace OlliVR
         {
             var m = glowAdditive ? glowMat : texMatZ;
             m.mainTexture = RoomTextures.Flames;
-            m.SetPass(0);
+            m.SetPass(m == glowMat ? glowPass : 0);
             float t = Time.unscaledTime;
             var basePos = new Vector3(room.FireOpeningX - 0.2f, room.FireOpeningY0 + 0.03f, room.FireOpeningZ);
             GL.Begin(GL.QUADS);
@@ -618,7 +698,7 @@ namespace OlliVR
             var uvs = new System.Collections.Generic.List<Vector2>();
             var cols = new System.Collections.Generic.List<Color>();
             var tris = new System.Collections.Generic.List<int>();
-            float strength = glowAdditive ? 1.0f : 1.0f;
+            float strength = glowAdditive ? 0.55f : 1.0f;
             const int NX = 64, NY = 40;
             var occ = OccluderBoxes();
             float tvBackZ = c.z + 0.1f;
@@ -631,7 +711,9 @@ namespace OlliVR
                     {
                         var p = posAt(i / (float)NX, j / (float)NY);
                         verts.Add(p); uvs.Add(uvAt(p));
-                        cols.Add(new Color(1f, 1f, 1f, Mathf.Clamp01(strength * glow * alphaAt(p))));
+                        float a = Mathf.Clamp01(strength * glow * alphaAt(p));
+                        // Additive: strength goes in the colour; blended: in the alpha.
+                        cols.Add(glowAdditive ? new Color(a, a, a, 1f) : new Color(1f, 1f, 1f, a));
                     }
                 for (int j = 0; j < NY; j++)
                     for (int i = 0; i < NX; i++)
@@ -642,7 +724,7 @@ namespace OlliVR
                     }
             }
 
-            float W = room.RoomHalfW, F = room.Floor, zw = room.ZFront - 0.004f;
+            float W = room.RoomHalfW, F = room.Floor, zw = room.ZFront - 0.026f; // just in front of the wall boards
             Grid((u, v) => new Vector3(Mathf.Lerp(-W, W, u), Mathf.Lerp(F, room.Ceil, v), zw),
                  p => new Vector2((p.x - c.x) / sw + 0.5f, (p.y - c.y) / sh + 0.5f),
                  p =>

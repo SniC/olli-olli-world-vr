@@ -34,7 +34,7 @@ namespace OlliVR
             for (int i = 0; i < knots.Length; i++) knots[i] = new Vector3(rng.Next(W), 60 + rng.Next(H - 120), 10 + rng.Next(16));
             var cracks = new Vector4[7];
             for (int i = 0; i < cracks.Length; i++) cracks[i] = new Vector4(rng.Next(W), 80 + rng.Next(H - 160), 160 + rng.Next(400), (float)rng.NextDouble() * 6f);
-            return MakeWithHeight(W, H, false, 2.5f, (x, y) =>
+            return MakeWithHeight(W, H, false, 4.0f, (x, y) =>
             {
                 float grain = Fbm(x / 128f, y / 8f, W / 128, H / 8, 51, 4);
                 float fibre = Fbm(x / 64f, y / 2f, W / 64, H / 2, 54, 2);

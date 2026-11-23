@@ -47,7 +47,14 @@ namespace OlliVR
         // Vertices in, colours out.
         public V3[] P, N, Tint;
         public bool[] Emissive, NoAo;
-        public V3[] Base, FireOnly;
+        public V3[] Base, FireOnly, TvOnly;
+
+        // The TV screen as an area light facing -z (its colour is applied live, per frame; this bakes only how
+        // much of the screen each point sees).
+        public bool HasTv;
+        public V3 TvCentre;
+        public float TvHalfW, TvHalfH;
+        V3[] tvSamples;
 
         static readonly V3[] AoDirs = MakeAoDirs(14);
 
@@ -56,13 +63,22 @@ namespace OlliVR
             int n = P.Length;
             Base = new V3[n];
             FireOnly = new V3[n];
+            TvOnly = new V3[n];
+            if (HasTv)
+            {
+                var s = new List<V3>();
+                for (int j = 0; j < 3; j++)
+                    for (int i = 0; i < 4; i++)
+                        s.Add(TvCentre + new V3((i - 1.5f) / 1.5f * TvHalfW * 0.85f, (j - 1f) * TvHalfH * 0.8f, -0.004f));
+                tvSamples = s.ToArray();
+            }
             var occ = Occluders.ToArray();
             Parallel.For(0, n, i => BakeVertex(i, occ));
         });
 
         void BakeVertex(int i, Obb[] occ)
         {
-            if (Emissive[i]) { Base[i] = Tint[i]; FireOnly[i] = V3.Zero; return; }
+            if (Emissive[i]) { Base[i] = Tint[i]; FireOnly[i] = V3.Zero; if (TvOnly != null) TvOnly[i] = V3.Zero; return; }
             var p = P[i];
             var nrm = N[i];
             var origin = p + nrm * 0.012f;
@@ -97,7 +113,28 @@ namespace OlliVR
             // The fire: a steady part baked in, the rest flickers additively at run time.
             light += fire * 0.55f;
             Base[i] = Tint[i] * ToneMap(light);
+            if (HasTv) TvOnly[i] = new V3(TvLight(p, origin, nrm, occ));
             FireOnly[i] = Tint[i] * (fire * 0.45f);
+        }
+
+        /// <summary>How much of the TV screen a point sees: lambert at both ends, distance falloff, shadows.</summary>
+        float TvLight(V3 p, V3 origin, V3 nrm, Obb[] occ)
+        {
+            if (p.Z > TvCentre.Z - 0.01f) return 0f;                 // behind the screen plane
+            float sum = 0f;
+            foreach (var s in tvSamples)
+            {
+                var d = s - origin;
+                float dist = d.Length();
+                var dir = d / dist;
+                float ndl = V3.Dot(nrm, dir);
+                float emit = dir.Z;                                    // the screen emits towards -z
+                if (ndl <= 0f || emit <= 0f) continue;
+                if (Blocked(origin, s, occ)) continue;
+                float att = 1f / (1f + (dist / 1.6f) * (dist / 1.6f));
+                sum += ndl * emit * att;
+            }
+            return sum / tvSamples.Length;
         }
 
         /// <summary>Soft roll-off above ~0.55 so bright pools don't clip flat.</summary>

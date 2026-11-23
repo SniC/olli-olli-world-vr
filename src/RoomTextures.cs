@@ -22,7 +22,7 @@ namespace OlliVR
         /// <summary>Main thread: turns the generated pixels into Unity textures.</summary>
         public static void UploadAll()
         {
-            foreach (var t in new[] { White, Wood, Wallpaper, Rug, Brick, Sky, Snow, Flames, Log, Stone, Plaid, Deck, NightSky, Mountains, Forest, NearTrees })
+            foreach (var t in new[] { White, Wood, Wallpaper, Rug, Brick, Sky, Snow, Flames, Log, Stone, Plaid, Deck, NightSky, Mountains, Forest, NearTrees, BoardGrain, Leather, Sheepskin, Painting, Halo })
                 t?.Create();
         }
 
@@ -38,6 +38,7 @@ namespace OlliVR
             Snow = MakeSnow(rng);
             Flames = MakeFlames();
             GenerateLodge(rng);
+            GenerateLodge2(rng);
         }
 
         static Texture2D Make(int w, int h, bool clamp, Func<int, int, Color32> f)
@@ -361,7 +362,9 @@ namespace OlliVR
                         if (v < 0.06f) heat *= v / 0.06f;
                         var c = heat > 0.7f ? Color.Lerp(new Color(1f, 0.75f, 0.25f), new Color(1f, 0.95f, 0.7f), (heat - 0.7f) / 0.3f)
                               : Color.Lerp(new Color(0.85f, 0.18f, 0.03f), new Color(1f, 0.75f, 0.25f), heat / 0.7f);
-                        px[y * W + f * FW + x] = C(c.r, c.g, c.b, Mathf.Clamp01(heat * 1.8f));
+                        // Premultiplied: drawn additively, so the colour must fade out with the alpha.
+                        float al = Mathf.Clamp01(heat * 1.8f);
+                        px[y * W + f * FW + x] = C(c.r * al, c.g * al, c.b * al, al);
                     }
             return Upload(W, FH, true, px);
         }
