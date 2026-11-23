@@ -1,40 +1,83 @@
-# OlliVR: OlliOlli World on a 3D screen in VR
+<p align="center"><img src="docs/banner.jpg" alt="OlliVR: OlliOlli World on a stereoscopic 3D screen in VR"></p>
 
-A BepInEx 6 (IL2CPP) plugin that shows OlliOlli World on a big stereoscopic 3D virtual screen in SteamVR (Steam Frame, Index, Quest Link, and so on). The game's own side-on framing is kept, with real 3D depth. **Head-coupled perspective** ("fish tank VR") makes the screen work like a window into the game world: lean or move your head and the view through it shifts. Play with a gamepad.
+# OlliVR
 
-## How it works
-- The game keeps its cameras disabled and renders them by hand. The mod notes, through `Camera.onPreCull`, which cameras actually rendered to the monitor each frame.
-- At the end of each frame, it renders those cameras again, once per eye, with a generalised off-axis projection. Each eye's real position (from SteamVR) looks through the screen rectangle. The screen maps to the game's image plane at the **convergence distance**, so objects there sit on the screen surface: nearer things pop out and farther things recede.
-- The screen size and window come from the game camera's actual projection. Cinemachine frames the skater left of centre with `Camera.lensShift`, which the mod applies to the eye window as well. Each eye renders at the game window's resolution. From the normal viewing position, the image is identical to the flat game.
-- The game uses its own scriptable render pipeline (`Roll7.NoComplyRenderer`). One property shapes the whole design: a camera render does **not** draw on top of its target. It renders into internal textures and replaces the whole target, and transparency is lost. So nothing can be drawn over an eye image afterwards.
-- The game's screen-space UI (menus, HUD, dialogue bubbles) stays in overlay-equivalent layout on the mod's own orthographic UI camera. Game code positions UI in screen pixels, and the "gloop" blob effect needs that too. Each eye image is placed as a full-screen background behind the UI on that camera, so one UI render produces "eye + UI", composited by the game's own UI path. The UI sits on the screen surface.
-- Each eye renders to its own texture. Both are copied into one side-by-side texture, alpha is forced opaque, and it's shown on a SteamVR overlay with the `SideBySide_Parallel` flag.
-- Orthographic views (the world map) are shown flat on the screen.
-- The monitor keeps showing the game's normal 3D view, but without the UI, which now lives on the mod's UI camera.
-- A dark backdrop goes to the compositor as the scene layer. Its `WaitGetPoses` pacing runs on Unity's render thread, so the game's main thread never blocks on SteamVR.
-- TAA is swapped for FXAA, and motion blur is turned off. Both misbehave when rendering two views per frame.
+A BepInEx 6 (IL2CPP) mod that puts **OlliOlli World** on a big stereoscopic 3D virtual screen in SteamVR. It works with the Steam Frame, Valve Index, Quest via Link or Virtual Desktop, and any other SteamVR headset. The game keeps its familiar side-on view, but now it has real depth. With **head-coupled perspective** ("fish tank VR") the screen acts like a window into the game world: lean or move your head and the view through it shifts. Play with a gamepad.
 
-## Install (already done on this machine)
-1. Copy BepInEx 6 Bleeding Edge, the IL2CPP win-x64 build, into the game folder. Run the game once so it generates `BepInEx\interop`.
-2. Run `dotnet build -c Release`. This copies `OlliVR.dll` and `openvr_api.dll` (taken from SteamVR) to `BepInEx\plugins\OlliVR\`. Use `-p:Deploy=false` to build while the game is running.
+## Features
+- **True stereo 3D.** The game's 3D world is rendered once per eye, so foreground rails pop out of the screen and backgrounds recede behind it.
+- **Fish tank VR.** Each eye looks through the screen with an off-axis projection that follows your real head position. The screen behaves like a window, not a flat picture.
+- **Faithful framing.** The screen matches the game camera's exact field of view and its off-centre framing (the skater on the left, room to see what's ahead). From the normal viewing position it looks like the flat game, plus depth.
+- **Steady, comfortable depth.** Convergence follows your skater, so the thing you watch sits on the screen surface and the depth doesn't jump as scenery passes.
+- **All the UI, intact.** Menus, the world map with its cursor, level cards and checkmarks, the HUD, speech bubbles and the title logo effects all appear on the screen.
+- **Comfortable screen.** A large virtual screen 2 m in front of you, with adjustable size, distance and height. It recenters automatically when you put the headset on, or on demand.
+- **VR-friendly post-processing.** TAA is replaced with FXAA and motion blur is turned off, because both misbehave when rendering two eyes.
+- **Your monitor keeps working.** The desktop window still shows the game.
+- **Configurable.** Depth strength, fish-tank strength, convergence and more, all in a BepInEx config file.
 
-## Use
-- Start the game with SteamVR running. The screen appears 2 m in front of you, and it recenters when you put the headset on.
-- **Recenter**: press F8, or hold L3 + R3 for 1 s.
-- Config file: `BepInEx\config\olliolliworld.vr.cfg`.
+<p align="center"><img src="docs/side-by-side.jpg" alt="Side-by-side stereo image as sent to the headset"><br><sub>The side-by-side image the headset receives (left eye, right eye).</sub></p>
+
+## Requirements
+- OlliOlli World on Steam (Windows).
+- SteamVR and a SteamVR-compatible headset.
+- A gamepad.
+- [BepInEx 6 Bleeding Edge](https://builds.bepinex.dev/projects/bepinex_be), the **IL2CPP win-x64** build. Tested with build **6.0.0-be.793**.
+
+## Installation
+1. **Install BepInEx.**
+   - Download `BepInEx-Unity.IL2CPP-win-x64-6.0.0-be.793` (or newer) from the [BepInEx bleeding edge builds](https://builds.bepinex.dev/projects/bepinex_be).
+   - Extract it into the game folder, for example `C:\Program Files (x86)\Steam\steamapps\common\OlliOlli World`, so that `winhttp.dll` and the `BepInEx` folder sit next to `OlliOlli World.exe`.
+2. **Run the game once without the mod.** BepInEx generates its interop assemblies on first launch. This takes a minute or two. Quit once you reach the title screen.
+3. **Install OlliVR.** Pick one:
+   - **Prebuilt:** download the latest zip from [Releases](../../releases) and extract it into the game folder. You should end up with `BepInEx\plugins\OlliVR\OlliVR.dll` and `openvr_api.dll`.
+   - **From source:** install the [.NET SDK](https://dotnet.microsoft.com/download) (6.0 or newer), clone this repo and build it:
+     ```powershell
+     dotnet build -c Release -p:GameDir="C:\Program Files (x86)\Steam\steamapps\common\OlliOlli World"
+     ```
+     The build compiles against the game's BepInEx interop assemblies. It copies `OlliVR.dll` and `openvr_api.dll` (from your SteamVR install) into `BepInEx\plugins\OlliVR\`. If SteamVR is not in the default Steam library, add `-p:SteamVRDir="<path to SteamVR>"`. Add `-p:Deploy=false` to build without copying, for example while the game is running.
+4. **Play.** Start SteamVR, put on your headset, then launch OlliOlli World from Steam.
+
+## Usage
+- The screen appears about 2 m in front of you. It recenters when you put the headset on.
+- **Recenter:** press **F8**, or hold **L3 + R3** on the gamepad for one second.
+- Lean in, sideways or up and down to look around inside the screen.
+- Settings live in `BepInEx\config\olliolliworld.vr.cfg`. The file is created on first launch.
 
 | Setting | Default | What it does |
 |---|---|---|
-| `ScreenDistance` | 2.0 | Distance to the screen in metres. |
-| `ScreenScale` | 1.0 | Screen size. At 1.0 the screen covers the game camera's FOV exactly. |
-| `ScreenHeightOffset` | 0 | Raise or lower the screen (metres). |
-| `DepthStrength` | 1.0 | Eye separation multiplier. Higher means deeper 3D; 0 is flat. |
-| `ConvergenceDistance` | 0 (auto) | Game-world distance that sits on the screen surface. Auto follows the skater's distance, with a raycast through the view centre as fallback. |
-| `HeadCoupled` | 1.0 | Fish-tank effect strength. 0 gives a fixed viewpoint. |
-| `FlipVertical` | true | Toggle if the screen is upside down. |
-| `VerboseLogging` | false | Camera, render and convergence diagnostics. |
+| `ScreenDistance` | 2.0 | Distance to the screen, in metres. |
+| `ScreenScale` | 1.0 | Screen size. At 1.0 the screen covers exactly the game camera's field of view. |
+| `ScreenHeightOffset` | 0 | Raise (+) or lower (−) the screen, in metres. |
+| `RecenterKey` | F8 | Keyboard key that recenters the screen. |
+| `DepthStrength` | 1.0 | Eye separation multiplier. Higher gives deeper 3D, 0 is flat. |
+| `ConvergenceDistance` | 0 (auto) | Game-world distance that sits on the screen surface. Auto follows the skater, with a raycast through the view centre as fallback. |
+| `HeadCoupled` | 1.0 | Fish-tank effect strength. 0 gives a fixed viewpoint, like a plain 3D TV. |
+| `UncapFramerate` | true | Turns off the game's vsync and frame cap so SteamVR paces the frames. |
+| `ReplaceTAA` | true | Replaces TAA with FXAA. |
+| `DisabledEffects` | MotionBlur | Comma-separated post-processing effects to turn off, for example `MotionBlur,DepthOfField,Vignette`. |
+| `FlipVertical` | true | Toggle this if the screen is upside down. |
+| `VerboseLogging` | false | Logs camera, render and convergence diagnostics. |
 
-An empty file `BepInEx\OlliVR_capture.trigger` makes the mod save the side-by-side image as `BepInEx\OlliVR_capture_Stereo.png`.
+## Troubleshooting
+- **Nothing in the headset:** check `BepInEx\LogOutput.log` for lines starting with `OlliVR`. The mod keeps retrying to connect to SteamVR every few seconds, so starting SteamVR after the game also works.
+- **Screen in the wrong place:** recenter with F8, or hold L3 + R3.
+- **Too much or too little depth:** lower or raise `DepthStrength`. If the fish-tank effect feels uncomfortable, set `HeadCoupled` to 0.
+- **Screenshots for bug reports:** create an empty file `BepInEx\OlliVR_capture.trigger`. The mod saves `BepInEx\OlliVR_capture_Stereo.png` within a second.
+
+## Known issues
+- Some shadows shimmer slightly in the headset.
+
+## How it works
+- The game keeps its cameras disabled and renders them by hand. The mod records, through `Camera.onPreCull`, which cameras rendered to the monitor each frame.
+- At the end of each frame it renders those cameras again, once per eye. Each eye gets a generalised off-axis projection: the eye's real position, from SteamVR, looks through the screen rectangle. The screen maps to the game's image plane at the convergence distance, so objects at that distance sit on the screen surface.
+- The screen's size and window come from the game camera's actual projection. Cinemachine frames the skater left of centre with `Camera.lensShift`, and the mod applies that shift to each eye's window as well.
+- The game uses its own scriptable render pipeline (`Roll7.NoComplyRenderer`). A camera render there replaces its whole target and drops alpha, so nothing can be drawn over an eye image afterwards. Instead, the game's screen-space UI moves to the mod's orthographic UI camera, laid out exactly like overlay mode. Each eye image is placed as a full-screen background behind the UI, so a single UI render produces "eye + UI".
+- Both eyes are combined into one side-by-side texture and shown on a SteamVR overlay with the `SideBySide_Parallel` flag. A dark backdrop is submitted as the scene, with frame pacing on Unity's render thread so the game never blocks on SteamVR.
 
 ## Uninstall
-Delete `winhttp.dll` from the game folder, or set `enabled = false` in `doorstop_config.ini`.
+Delete `BepInEx\plugins\OlliVR`. To remove BepInEx completely, also delete `winhttp.dll` from the game folder.
+
+## Credits
+- [BepInEx](https://github.com/BepInEx/BepInEx) and Il2CppInterop.
+- [OpenVR](https://github.com/ValveSoftware/openvr) by Valve (`src/OpenVR/openvr_api.cs`, BSD-3-Clause).
+- OlliOlli World is made by Roll7 and published by Private Division. This is an unofficial fan mod, not affiliated with them.
