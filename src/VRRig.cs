@@ -25,7 +25,8 @@ namespace OlliVR
         public VRRig(IntPtr ptr) : base(ptr) { }
 
         ScreenOverlays screen;
-        RenderTexture backdropL, backdropR;
+        Ambience ambience;
+        long ambienceTicks; int ambienceFrames; float nextAmbienceLog;
         bool initialized, failed, captureRequested;
         float nextInitAttempt;
         const int UILayerMask = 1 << 5;
@@ -71,10 +72,10 @@ namespace OlliVR
             if (failed) Plugin.L.LogInfo("OpenVR connected after retry.");
             VRSession.TraceBudget = 0;
 
-            // The scene layer is just a dark room behind the screen; small textures cleared once.
-            backdropL = MakeBackdrop("OlliVR_BackdropL");
-            backdropR = MakeBackdrop("OlliVR_BackdropR");
-            VRSession.SetEyeTextures(backdropL.GetNativeTexturePtr(), backdropR.GetNativeTexturePtr(), Plugin.Cfg.FlipVertical.Value);
+            // The scene layer is the room around the screen, lit by the screen's colours.
+            ambience = new Ambience();
+            ambience.Init();
+            VRSession.SetEyeTextures(ambience.Left.GetNativeTexturePtr(), ambience.Right.GetNativeTexturePtr(), Plugin.Cfg.FlipVertical.Value);
 
             eyeOffsetL = VRSession.GetEyeOffset(EVREye.Eye_Left);
             eyeOffsetR = VRSession.GetEyeOffset(EVREye.Eye_Right);
@@ -86,18 +87,6 @@ namespace OlliVR
 
             initialized = true;
             return true;
-        }
-
-        static RenderTexture MakeBackdrop(string name)
-        {
-            var rt = new RenderTexture(256, 256, 0, RenderTextureFormat.ARGB32) { name = name, hideFlags = HideFlags.HideAndDontSave };
-            rt.Create();
-            UnityEngine.Object.DontDestroyOnLoad(rt);
-            var prev = RenderTexture.active;
-            RenderTexture.active = rt;
-            GL.Clear(true, true, new Color(0.035f, 0.035f, 0.045f, 1f));
-            RenderTexture.active = prev;
-            return rt;
         }
 
         void Update()
@@ -292,9 +281,23 @@ namespace OlliVR
             ForceOpaque(screen.StereoTexture);
             GL.IssuePluginEvent(VRSession.RenderEventFunc, VRSession.EventSubmitScreen);
 
+            // The room around the screen, lit by this frame's image.
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            ambience.UpdateGlow(screen.EyeLeft);
+            ambience.Render(hmdPos, hmdRot, originPos, originRot, screen);
+            ambienceTicks += System.Diagnostics.Stopwatch.GetTimestamp() - t0;
+            ambienceFrames++;
+            if (Time.unscaledTime >= nextAmbienceLog)
+            {
+                nextAmbienceLog = Time.unscaledTime + 10f;
+                double ms = ambienceTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency / Math.Max(1, ambienceFrames);
+                Plugin.L.LogInfo($"Ambience CPU: {ms:0.000} ms/frame over {ambienceFrames} frames");
+                ambienceTicks = 0; ambienceFrames = 0;
+            }
+
             if (captureRequested) { captureRequested = false; Capture(hmdPos, hmdRot); }
 
-            // Backdrop eye frames keep SteamVR's scene layer (and frame pacing) going behind the screen.
+            // The room eye frames are SteamVR's scene layer (and drive frame pacing) behind the screen.
             GL.IssuePluginEvent(VRSession.RenderEventFunc, VRSession.PrepareSubmit());
         }
 
@@ -628,6 +631,7 @@ namespace OlliVR
             {
                 var dir = BepInEx.Paths.BepInExRootPath;
                 SaveRT(screen.StereoTexture, System.IO.Path.Combine(dir, "OlliVR_capture_Stereo.png"));
+                SaveRT(ambience.Left, System.IO.Path.Combine(dir, "OlliVR_capture_Room.png"));
                 {
                     var prev = RenderTexture.active;
                     RenderTexture.active = screen.StereoTexture;

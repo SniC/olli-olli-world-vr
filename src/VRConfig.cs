@@ -17,6 +17,9 @@ namespace OlliVR
         public readonly ConfigEntry<float> ConvergenceDistance;
         public readonly ConfigEntry<float> HeadCoupled;
 
+        public readonly ConfigEntry<float> AmbientGlow;
+        public readonly ConfigEntry<float> FloorReflection;
+
         public readonly ConfigEntry<bool> FlipVertical;
         public readonly ConfigEntry<bool> ReplaceTAA;
         public readonly ConfigEntry<string> DisabledEffects;
@@ -50,6 +53,11 @@ namespace OlliVR
             HeadCoupled = f.Bind("Stereo", "HeadCoupled", 1.0f,
                 "Fish-tank VR: how much your head movement changes the perspective, as if the screen were a window into " +
                 "the game. 1.0 = full window effect, 0 = fixed viewpoint (plain 3D screen).");
+
+            AmbientGlow = f.Bind("Environment", "AmbientGlow", 1.0f,
+                "Brightness of the light the screen's edge colours cast on the wall and floor around it. 0 = dark room.");
+            FloorReflection = f.Bind("Environment", "FloorReflection", 0.12f,
+                "Strength of the screen's reflection in the floor (0 to 1). 0 = off.");
 
             FlipVertical = f.Bind("Rendering", "FlipVertical", true,
                 "Flip images vertically on submit. Toggle if the screen is upside down.");

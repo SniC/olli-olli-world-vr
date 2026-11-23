@@ -167,6 +167,29 @@ namespace OlliVR
             return pos;
         }
 
+        /// <summary>Full eye-to-head transform (some headsets have canted displays).</summary>
+        public static void GetEyeToHead(EVREye eye, out Vector3 pos, out Quaternion rot)
+            => ToUnity(System.GetEyeToHeadTransform(eye), out pos, out rot);
+
+        /// <summary>The headset's own projection for an eye, as a Unity camera projection matrix.</summary>
+        public static Matrix4x4 GetEyeProjection(EVREye eye, float near, float far)
+        {
+            var p = System.GetProjectionMatrix(eye, near, far);
+            var m = new Matrix4x4();
+            m.m00 = p.m0; m.m01 = p.m1; m.m02 = p.m2; m.m03 = p.m3;
+            m.m10 = p.m4; m.m11 = p.m5; m.m12 = p.m6; m.m13 = p.m7;
+            m.m20 = p.m8; m.m21 = p.m9; m.m22 = p.m10; m.m23 = p.m11;
+            m.m30 = p.m12; m.m31 = p.m13; m.m32 = p.m14; m.m33 = p.m15;
+            return m;
+        }
+
+        /// <summary>Height of the seated zero pose above the floor, or 0 when unknown.</summary>
+        public static float SeatedHeightAboveFloor()
+        {
+            try { return System.GetSeatedZeroPoseToStandingAbsoluteTrackingPose().m7; }
+            catch { return 0f; }
+        }
+
         /// <summary>OpenGL-style off-centre projection from view-space tangents (extent / distance).</summary>
         public static Matrix4x4 Frustum(float left, float right, float bottom, float top, float n, float f)
         {

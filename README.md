@@ -47,6 +47,8 @@ The zip includes an unmodified [BepInEx](https://github.com/BepInEx/BepInEx) 6.0
 | `DepthStrength` | 1.0 | Eye separation multiplier. Higher gives deeper 3D, 0 is flat. |
 | `ConvergenceDistance` | 0 (auto) | Game-world distance that sits on the screen surface. Auto follows the skater, with a raycast through the view centre as fallback. |
 | `HeadCoupled` | 1.0 | Fish-tank effect strength. 0 gives a fixed viewpoint, like a plain 3D TV. |
+| `AmbientGlow` | 1.0 | Brightness of the glow the screen casts on the wall and floor around it. 0 gives a dark room. |
+| `FloorReflection` | 0.12 | Strength of the screen's blurred reflection in the floor. 0 turns it off. |
 | `UncapFramerate` | true | Turns off the game's vsync and frame cap so SteamVR paces the frames. |
 | `ReplaceTAA` | true | Replaces TAA with FXAA. |
 | `DisabledEffects` | MotionBlur | Comma-separated post-processing effects to turn off, for example `MotionBlur,DepthOfField,Vignette`. |
