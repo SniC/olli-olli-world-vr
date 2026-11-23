@@ -24,10 +24,10 @@ namespace OlliVR
 
         static readonly Color ClearColor = new(0.02f, 0.02f, 0.026f, 1f);
         const float GlowFalloff = 0.28f;   // metres for the glow to drop to ~37%: concentrated behind the TV
-        const float GlowBoost = 1.6f;      // colour gain on the glow (the source is an average, so it reads dim)
+        const float GlowBoost = 1.25f;     // colour gain on the glow (the source is an average, so it reads dim)
 
         readonly CozyRoom room = new();
-        RenderTexture mipSource, glowRaw, glowSmooth, msaaL, msaaR;
+        RenderTexture mipSource, glowRaw, glowSmooth, msaaL, msaaR, reflL, reflR;
         Material depthMat, texMat, texMatZ, glowMat, addMat;
         bool glowAdditive;
         Matrix4x4 projL, projR;
@@ -36,6 +36,9 @@ namespace OlliVR
         float seatedHeight;
         bool ready;
         float snowOffset1, snowOffset2;
+        System.Threading.Tasks.Task texTask;
+        System.Diagnostics.Stopwatch texTimer;
+        bool texturesReady;
 
         public bool Init()
         {
@@ -46,6 +49,10 @@ namespace OlliVR
             msaaR = MakeRT("OlliVR_RoomR_MSAA", w, h, false, 24, 4);
             Left = MakeRT("OlliVR_RoomL", w, h, false, 0);
             Right = MakeRT("OlliVR_RoomR", w, h, false, 0);
+            // Half-size mirrored room for the glossy floor; its mips give the blur.
+            reflL = MakeRT("OlliVR_ReflL", w / 2, h / 2, true, 24);
+            reflR = MakeRT("OlliVR_ReflR", w / 2, h / 2, true, 24);
+            reflL.mipMapBias = 1.0f; reflR.mipMapBias = 1.0f;
             Clear(Left, ClearColor); Clear(Right, ClearColor);
 
             mipSource = MakeRT("OlliVR_GlowMips", 256, 144, true, 0);
@@ -62,7 +69,8 @@ namespace OlliVR
                 return true; // textures still valid as a plain backdrop
             }
 
-            depthMat = ColoredMat(colored, BlendMode.One, BlendMode.Zero, zWrite: true, CompareFunction.LessEqual);
+            // Depth only: blend Zero/One leaves the colour untouched (the floor reflection lies underneath).
+            depthMat = ColoredMat(colored, BlendMode.Zero, BlendMode.One, zWrite: true, CompareFunction.LessEqual);
             depthMat.color = Color.black;
             addMat = ColoredMat(colored, BlendMode.One, BlendMode.One, zWrite: false, CompareFunction.LessEqual);
             texMat = TexturedMat(textured, CompareFunction.Always);
@@ -84,7 +92,10 @@ namespace OlliVR
                 glowMat.color = new Color(GlowBoost, GlowBoost, GlowBoost, 1f);
             }
 
-            RoomTextures.Generate();
+            // Textures are generated on a worker thread (pure managed maths) and uploaded when ready.
+            texTimer = System.Diagnostics.Stopwatch.StartNew();
+            texTask = System.Threading.Tasks.Task.Run(RoomTextures.Generate);
+
 
             projL = VRSession.GetEyeProjection(EVREye.Eye_Left, 0.05f, 100f);
             projR = VRSession.GetEyeProjection(EVREye.Eye_Right, 0.05f, 100f);
@@ -179,6 +190,14 @@ namespace OlliVR
                            ScreenOverlays screen)
         {
             if (!ready) return;
+            if (!texturesReady)
+            {
+                if (!texTask.IsCompleted) return;
+                if (texTask.IsFaulted) { Plugin.L.LogError("Room texture generation failed: " + texTask.Exception); ready = false; return; }
+                RoomTextures.UploadAll();
+                texturesReady = true;
+                Plugin.L.LogInfo($"Room textures ready in {texTimer.ElapsedMilliseconds} ms (generated off the main thread).");
+            }
             float glow = Mathf.Max(0f, Plugin.Cfg.AmbientGlow.Value);
             float reflection = Mathf.Clamp01(Plugin.Cfg.FloorReflection.Value);
 
@@ -198,6 +217,7 @@ namespace OlliVR
                 BuildGlowMesh(c, sw, sh, glow);
             }
 
+            room.TryFinish();
             lastOriginPos = originPos; lastOriginRot = originRot;
             lastC = c; lastSw = sw; lastSh = sh; lastFloorY = floorY; lastGlow = glow; lastReflection = reflection;
             AnimateFire();
@@ -205,30 +225,37 @@ namespace OlliVR
             snowOffset1 = Mathf.Repeat(snowOffset1 + dt * 0.10f, 1f);
             snowOffset2 = Mathf.Repeat(snowOffset2 + dt * 0.06f, 1f);
 
-            RenderEye(msaaL, hmdPos + hmdRot * eyePosL, hmdRot * eyeRotL, projL, roomM, c, sw, sh, floorY, glow, reflection);
+            UpdateSparks(dt);
+            lastScreenImg = screen.StereoTexture;
+            RenderEye(msaaL, reflL, hmdPos + hmdRot * eyePosL, hmdRot * eyeRotL, projL, roomM, originRot, floorY, glow, reflection, screen.StereoTexture, 0f, 0.5f);
             msaaL.ResolveAntiAliasedSurface(Left);
-            RenderEye(msaaR, hmdPos + hmdRot * eyePosR, hmdRot * eyeRotR, projR, roomM, c, sw, sh, floorY, glow, reflection);
+            RenderEye(msaaR, reflR, hmdPos + hmdRot * eyePosR, hmdRot * eyeRotR, projR, roomM, originRot, floorY, glow, reflection, screen.StereoTexture, 0.5f, 1f);
             msaaR.ResolveAntiAliasedSurface(Right);
         }
 
         Vector3 lastOriginPos; Quaternion lastOriginRot = Quaternion.identity;
         Vector3 lastC; float lastSw, lastSh, lastFloorY, lastGlow, lastReflection;
+        Texture lastScreenImg;
 
         /// <summary>Debug: renders the room from the recentered head position looking left, ahead and right.</summary>
         public void CaptureViews(string dir, System.Action<RenderTexture, string> save, Texture screenImage)
         {
             if (!ready || room.Opaque.Count == 0) return;
             var rt = MakeRT("OlliVR_RoomCapture", 1600, 1000, false, 24);
+            var reflCap = MakeRT("OlliVR_RoomCaptureRefl", 800, 500, true, 24);
+            reflCap.mipMapBias = 1.0f;
             var proj = Matrix4x4.Perspective(90f, 1.6f, 0.05f, 100f);
             var roomM = Matrix4x4.TRS(lastOriginPos, lastOriginRot, Vector3.one);
-            foreach (var (name, yaw) in new[] { ("Left", -75f), ("Ahead", 0f), ("Right", 75f) })
+            foreach (var (name, yaw) in new[] { ("Left", -75f), ("Ahead", 0f), ("Right", 75f), ("Behind", 180f) })
             {
                 var rot = lastOriginRot * Quaternion.Euler(12f, yaw, 0f);
-                RenderEye(rt, lastOriginPos, rot, proj, roomM, lastC, lastSw, lastSh, lastFloorY, lastGlow, lastReflection);
+                RenderEye(rt, reflCap, lastOriginPos, rot, proj, roomM, lastOriginRot, lastFloorY, lastGlow, lastReflection, lastScreenImg, 0f, 0.5f);
                 DrawScreenForCapture(rt, lastOriginPos, rot, proj, roomM, screenImage);
                 save(rt, System.IO.Path.Combine(dir, $"OlliVR_capture_Room{name}.png"));
             }
             rt.Release();
+            reflCap.Release();
+            Object.Destroy(reflCap);
             Object.Destroy(rt);
         }
 
@@ -260,42 +287,79 @@ namespace OlliVR
             // Smoothly wandering intensity with quick small flickers on top.
             if (Time.unscaledTime >= nextFireChange)
             {
-                fireTarget = Random.Range(0.86f, 1.06f);
+                fireTarget = Random.Range(0.70f, 1.15f);
                 nextFireChange = Time.unscaledTime + Random.Range(0.12f, 0.35f);
             }
             fireIntensity = Mathf.Lerp(fireIntensity, fireTarget, 1f - Mathf.Exp(-Time.unscaledDeltaTime * 6f));
         }
 
-        void RenderEye(RenderTexture rt, Vector3 eyePos, Quaternion eyeRot, Matrix4x4 proj, Matrix4x4 roomM,
-                       Vector3 c, float sw, float sh, float floorY, float glow, float reflection)
+        /// <summary>
+        /// One eye. With floor reflections on, the room is first drawn mirrored under the floor into a half-size
+        /// texture; that is blurred via its mip chain (a glossy, not mirror-like, finish) and laid down first.
+        /// The floor is drawn partly transparent over it, then everything else on top.
+        /// </summary>
+        void RenderEye(RenderTexture rt, RenderTexture refl, Vector3 eyePos, Quaternion eyeRot, Matrix4x4 proj,
+                       Matrix4x4 roomM, Quaternion roomRot, float floorY, float glow, float reflection,
+                       Texture screenImg, float su0, float su1)
         {
             var prev = RenderTexture.active;
+            var view = Matrix4x4.Scale(new Vector3(1f, 1f, -1f)) * Matrix4x4.TRS(eyePos, eyeRot, Vector3.one).inverse;
+            var eyeLocal = roomM.inverse.MultiplyPoint3x4(eyePos);
+            var localRot = Quaternion.Inverse(roomRot) * eyeRot;
+            var camRight = localRot * Vector3.right;
+            var camUp = localRot * Vector3.up;
+            bool doRefl = refl != null && reflection > 0f && room.Opaque.Count > 0;
+
+            if (doRefl)
+            {
+                RenderTexture.active = refl;
+                GL.Clear(true, true, ClearColor);
+                GL.PushMatrix();
+                GL.LoadProjectionMatrix(proj);
+                var mirror = roomM * Matrix4x4.TRS(new Vector3(0, 2f * floorY, 0), Quaternion.identity, new Vector3(1f, -1f, 1f));
+                DrawScene(view, mirror, 1, glow, eyeLocal, camRight, camUp, screenImg, su0, su1, false);
+                GL.PopMatrix();
+            }
+
             RenderTexture.active = rt;
             GL.Clear(true, true, ClearColor);
+            if (doRefl)
+            {
+                // The mirrored room, softly blurred, as the backdrop that shows through the varnished floor.
+                GL.PushMatrix();
+                GL.LoadOrtho();
+                texMat.mainTexture = refl;
+                texMat.SetPass(0);
+                GL.Begin(GL.QUADS);
+                GL.Color(Color.white);
+                GL.TexCoord2(0, 0); GL.Vertex3(0, 0, 0);
+                GL.TexCoord2(0, 1); GL.Vertex3(0, 1, 0);
+                GL.TexCoord2(1, 1); GL.Vertex3(1, 1, 0);
+                GL.TexCoord2(1, 0); GL.Vertex3(1, 0, 0);
+                GL.End();
+                GL.PopMatrix();
+            }
             GL.PushMatrix();
             GL.LoadProjectionMatrix(proj);
-            var view = Matrix4x4.Scale(new Vector3(1f, 1f, -1f)) * Matrix4x4.TRS(eyePos, eyeRot, Vector3.one).inverse;
-            GL.modelview = view;
+            DrawScene(view, roomM, 0, glow, eyeLocal, camRight, camUp, null, 0, 0, true);
+            GL.PopMatrix();
+            RenderTexture.active = prev;
+        }
 
-            // Opaque room: depth first, then textures where the depth matches.
-            // The floor reflection goes right after the shell (first part), before furniture can cover it.
-            for (int i = 0; i < room.Opaque.Count; i++)
+        /// <summary>Draws the room with the given model matrix (normal or mirrored).</summary>
+        void DrawScene(Matrix4x4 view, Matrix4x4 model, int firstPart, float glow, Vector3 eyeLocal, Vector3 camRight, Vector3 camUp,
+                       Texture screenImg, float su0, float su1, bool main)
+        {
+            GL.modelview = view;
+            // Opaque room: depth first (no colour), then textures where the depth matches.
+            for (int i = firstPart; i < room.Opaque.Count; i++)
             {
                 var part = room.Opaque[i];
                 depthMat.SetPass(0);
-                Graphics.DrawMeshNow(part.Mesh, roomM);
+                Graphics.DrawMeshNow(part.Mesh, model);
                 texMatZ.mainTexture = part.Tex;
                 texMatZ.SetPass(0);
-                Graphics.DrawMeshNow(part.Mesh, roomM);
-                if (i == 0 && reflection > 0f)
-                {
-                    // Wood floor (first part) is glossy: a blurred reflection of the screen.
-                    GL.modelview = view * roomM;
-                    texMat.mainTexture = mipSource;
-                    texMat.SetPass(0);
-                    DrawReflection(c, sw, sh, floorY, reflection);
-                    GL.modelview = view;
-                }
+                Graphics.DrawMeshNow(part.Mesh, model);
             }
 
             // Fire light flickering over the room.
@@ -303,7 +367,15 @@ namespace OlliVR
             {
                 addMat.color = new Color(fireIntensity, fireIntensity, fireIntensity, 1f);
                 addMat.SetPass(0);
-                Graphics.DrawMeshNow(room.FireLight, roomM);
+                Graphics.DrawMeshNow(room.FireLight, model);
+            }
+
+            // Scenery outside the window, far to near (seen only through the window thanks to the depth test).
+            for (int i = 0; i < room.Outside.Count; i++)
+            {
+                texMatZ.mainTexture = room.Outside[i].Tex;
+                texMatZ.SetPass(0);
+                Graphics.DrawMeshNow(room.Outside[i].Mesh, model);
             }
 
             // Screen glow on the wall behind it and the floor.
@@ -311,16 +383,177 @@ namespace OlliVR
             {
                 glowMat.mainTexture = glowSmooth;
                 glowMat.SetPass(0);
-                Graphics.DrawMeshNow(glowMesh, roomM);
+                Graphics.DrawMeshNow(glowMesh, model);
             }
 
-            // Animated bits: flames and snow (a few quads each).
-            GL.modelview = view * roomM;
+            GL.modelview = view * model;
             DrawFlames();
+            DrawCandleFlames(eyeLocal);
             DrawSnow();
+            if (screenImg != null) DrawScreenQuad(screenImg, su0, su1);
+            if (main)
+            {
+                DrawSparks(camRight, camUp);
+                DrawHalos(view, model, eyeLocal);
+            }
+        }
 
-            GL.PopMatrix();
-            RenderTexture.active = prev;
+        /// <summary>The game picture on the TV (for the floor reflection; the real one is the SteamVR overlay).</summary>
+        void DrawScreenQuad(Texture img, float u0, float u1)
+        {
+            texMatZ.mainTexture = img;
+            texMatZ.SetPass(0);
+            float x0 = lastC.x - lastSw / 2, x1 = lastC.x + lastSw / 2, y0 = lastC.y - lastSh / 2, y1 = lastC.y + lastSh / 2;
+            GL.Begin(GL.QUADS);
+            GL.Color(Color.white);
+            GL.TexCoord2(u0, 0); GL.Vertex3(x0, y0, lastC.z);
+            GL.TexCoord2(u0, 1); GL.Vertex3(x0, y1, lastC.z);
+            GL.TexCoord2(u1, 1); GL.Vertex3(x1, y1, lastC.z);
+            GL.TexCoord2(u1, 0); GL.Vertex3(x1, y0, lastC.z);
+            GL.End();
+        }
+
+        // ---- glow halos and embers ------------------------------------------------------------------------
+
+        // Per-vertex maths for the effects below uses System.Numerics: Unity's Vector3 operators go through the
+        // IL2CPP bridge and add up quickly when done thousands of times per frame.
+        static System.Numerics.Vector3 N3(Vector3 v) => new(v.x, v.y, v.z);
+        static void Vtx(System.Numerics.Vector3 v) => GL.Vertex3(v.X, v.Y, v.Z);
+
+        Mesh haloMesh;
+
+        /// <summary>A unit disc facing +z: bright centre, soft falloff to a black (no-op when added) rim.</summary>
+        Mesh HaloMesh()
+        {
+            if (haloMesh != null) return haloMesh;
+            const int Seg = 20;
+            var v = new Vector3[1 + Seg * 2];
+            var c = new Color[v.Length];
+            var t = new int[Seg * 9];
+            v[0] = Vector3.zero; c[0] = Color.white;
+            for (int i = 0; i < Seg; i++)
+            {
+                float a = i / (float)Seg * Mathf.PI * 2f;
+                float x = Mathf.Cos(a), y = Mathf.Sin(a);
+                v[1 + i] = new Vector3(x * 0.3f, y * 0.3f, 0); c[1 + i] = new Color(0.28f, 0.28f, 0.28f, 1f);
+                v[1 + Seg + i] = new Vector3(x, y, 0); c[1 + Seg + i] = Color.black;
+            }
+            for (int i = 0; i < Seg; i++)
+            {
+                int i0 = 1 + i, i1 = 1 + (i + 1) % Seg, o0 = 1 + Seg + i, o1 = 1 + Seg + (i + 1) % Seg, k = i * 9;
+                t[k] = 0; t[k + 1] = i0; t[k + 2] = i1;
+                t[k + 3] = i0; t[k + 4] = o0; t[k + 5] = o1;
+                t[k + 6] = i0; t[k + 7] = o1; t[k + 8] = i1;
+            }
+            haloMesh = new Mesh { name = "OlliVR_Halo", hideFlags = HideFlags.HideAndDontSave };
+            haloMesh.vertices = v; haloMesh.colors = c; haloMesh.triangles = t;
+            haloMesh.UploadMeshData(true);
+            Object.DontDestroyOnLoad(haloMesh);
+            return haloMesh;
+        }
+
+        /// <summary>
+        /// Soft additive halos around light sources (a cheap stand-in for bloom): one prebuilt disc per light,
+        /// facing the eye and pulled slightly towards it so it does not clip into the surface behind.
+        /// </summary>
+        void DrawHalos(Matrix4x4 view, Matrix4x4 model, Vector3 eyeLocal)
+        {
+            if (room.Glows.Count == 0) return;
+            var mesh = HaloMesh();
+            GL.modelview = view;
+            var eye = N3(eyeLocal);
+            foreach (var g in room.Glows)
+            {
+                float k = g.fire ? fireIntensity : 1f;
+                var p = N3(g.pos);
+                var toEye = System.Numerics.Vector3.Normalize(eye - p);
+                var c = p + toEye * System.MathF.Min(g.radius * 0.8f, 0.25f);
+                addMat.color = g.colour * k;
+                addMat.SetPass(0);
+                var rot = Quaternion.LookRotation(new Vector3(toEye.X, toEye.Y, toEye.Z));
+                Graphics.DrawMeshNow(mesh, model * Matrix4x4.TRS(new Vector3(c.X, c.Y, c.Z), rot, new Vector3(g.radius, g.radius, g.radius)));
+            }
+        }
+
+        struct Spark { public System.Numerics.Vector3 P, V; public float Age, Life; }
+        readonly Spark[] sparks = new Spark[36];
+        readonly System.Random fxRng = new(5);
+        float Rnd(float a, float b) => a + (float)fxRng.NextDouble() * (b - a);
+
+        /// <summary>Embers drifting up from the fire and fading out, mostly up the flue.</summary>
+        void UpdateSparks(float dt)
+        {
+            for (int i = 0; i < sparks.Length; i++)
+            {
+                ref var s = ref sparks[i];
+                s.Age += dt;
+                if (s.Age >= s.Life || s.Life <= 0f)
+                {
+                    s.P = new(room.FireOpeningX - 0.24f + Rnd(-0.06f, 0.1f), room.FireOpeningY0 + 0.1f + Rnd(0f, 0.08f), room.FireOpeningZ + Rnd(-0.22f, 0.22f));
+                    s.V = new(Rnd(0.0f, 0.08f), Rnd(0.25f, 0.6f), Rnd(-0.05f, 0.05f));
+                    s.Life = Rnd(0.5f, 1.5f);
+                    s.Age = Rnd(0f, 0.2f);
+                    continue;
+                }
+                s.V += new System.Numerics.Vector3(Rnd(-0.4f, 0.4f), 0.1f, Rnd(-0.4f, 0.4f)) * dt;
+                s.P += s.V * dt;
+            }
+        }
+
+        void DrawSparks(Vector3 rightU, Vector3 upU)
+        {
+            addMat.color = Color.white;
+            addMat.SetPass(0);
+            var right = N3(rightU) * 0.005f;
+            var up = N3(upU) * 0.005f;
+            GL.Begin(GL.QUADS);
+            foreach (var s in sparks)
+            {
+                if (s.Life <= 0f) continue;
+                float t = s.Age / s.Life;
+                float b = (1f - t) * (1f - t) * (0.6f + 0.4f * System.MathF.Sin(s.Age * 40f + s.Life * 13f)) * 1.4f;
+                GL.Color(new Color(b, 0.55f * b, 0.15f * b, 1f));
+                Vtx(s.P - right - up);
+                Vtx(s.P - right + up * 2.5f);
+                Vtx(s.P + right + up * 2.5f);
+                Vtx(s.P + right - up);
+            }
+            GL.End();
+        }
+
+        /// <summary>Small animated candle flames, each turned to face the eye (rotating about the vertical).</summary>
+        void DrawCandleFlames(Vector3 eyeLocalU)
+        {
+            if (room.Candles.Count == 0) return;
+            var m = glowAdditive ? glowMat : texMatZ;
+            m.mainTexture = RoomTextures.Flames;
+            m.SetPass(0);
+            float t = Time.unscaledTime;
+            var eye = N3(eyeLocalU);
+            GL.Begin(GL.QUADS);
+            GL.Color(Color.white);
+            for (int i = 0; i < room.Candles.Count; i++)
+            {
+                var (pu, s) = room.Candles[i];
+                var p = N3(pu);
+                var toEye = eye - p; toEye.Y = 0f;
+                var right = toEye.LengthSquared() > 1e-6f
+                    ? System.Numerics.Vector3.Normalize(new System.Numerics.Vector3(toEye.Z, 0, -toEye.X))
+                    : System.Numerics.Vector3.UnitX;
+                int frame = (int)(t * 14f + i * 3.7f) % RoomTextures.FlameFrames;
+                float u0 = frame / (float)RoomTextures.FlameFrames, u1 = (frame + 1) / (float)RoomTextures.FlameFrames;
+                float flicker = 0.9f + 0.1f * System.MathF.Sin(t * 11f + i * 2.3f) * System.MathF.Sin(t * 7.3f + i);
+                float w = 0.026f * s, h = 0.06f * s * flicker;
+                var a = p - right * (w / 2);
+                var b = p + right * (w / 2);
+                var top = new System.Numerics.Vector3(0, h, 0);
+                var down = new System.Numerics.Vector3(0, 0.006f, 0);
+                GL.TexCoord2(u0, 0); Vtx(a - down);
+                GL.TexCoord2(u0, 1); Vtx(a + top);
+                GL.TexCoord2(u1, 1); Vtx(b + top);
+                GL.TexCoord2(u1, 0); Vtx(b - down);
+            }
+            GL.End();
         }
 
         void DrawFlames()
@@ -417,7 +650,7 @@ namespace OlliVR
                      float dx = Mathf.Max(Mathf.Abs(p.x - c.x) - sw * 0.5f, 0f);
                      float dy = Mathf.Max(Mathf.Abs(p.y - c.y) - sh * 0.5f, 0f);
                      // Light comes from behind the TV; furniture between the TV and the wall casts shadow.
-                     return 0.95f * Falloff(Mathf.Sqrt(dx * dx + dy * dy)) *
+                     return 0.7f * Falloff(Mathf.Sqrt(dx * dx + dy * dy)) *
                             Visibility(p, occ, c.x - sw * 0.45f, c.x + sw * 0.45f, c.y - sh * 0.45f, c.y + sh * 0.45f, tvBackZ);
                  });
             float drop = c.y - sh * 0.5f - F;

@@ -4,19 +4,23 @@ using UnityEngine;
 namespace OlliVR
 {
     /// <summary>
-    /// Geometry and baked lighting of the cozy room around the screen, in the recentered room frame
+    /// Geometry and baked lighting of the wooden lodge around the screen, in the recentered room frame
     /// (origin at the recentered head, x right, y up, z towards the screen).
     ///
-    /// Layout: the screen floats in front of a dark accent wall above a low TV cabinet; floor lamps on both
-    /// sides; a brick fireplace on the left wall; a window with a snowy night outside on the right wall; a rug,
-    /// wooden floor and ceiling beams. Lighting is computed per vertex once (lamps, moonlight, embers, ambient,
-    /// corner darkening). The fire's flicker is a separate additive mesh whose brightness animates per frame.
+    /// Log walls on three sides, a vertical-plank feature wall behind the TV, a pitched roof with exposed trusses
+    /// and a wrought-iron chandelier; a river-stone chimney with an open fire on the left; a big window onto a
+    /// moonlit snowy mountain range on the right; a plank door with a skateboard leaning next to it behind you.
+    /// Lighting is computed per vertex once (lamp, chandelier, moonlight, embers, ambient, corner darkening).
+    /// The fire's flicker is a separate additive mesh whose brightness animates per frame. The view outside is a
+    /// stack of layers at different distances (sky, mountains, forest, near pines) for real parallax.
     /// </summary>
     internal class CozyRoom
     {
         public struct Part { public Mesh Mesh; public Texture Tex; }
 
         public readonly List<Part> Opaque = new();
+        /// <summary>Alpha-blended scenery outside the window, far to near.</summary>
+        public readonly List<Part> Outside = new();
         public Mesh FireLight;              // additive, same surfaces, fire contribution only
         public Vector3 FirePos;             // flames centre
         public float FireOpeningX, FireOpeningZ, FireOpeningY0;
@@ -25,88 +29,152 @@ namespace OlliVR
         public float RoomHalfW, ZBack, ZFront, Floor, Ceil;
         /// <summary>Solid furniture that blocks the screen glow (axis-aligned boxes, room frame).</summary>
         public readonly List<Bounds> Occluders = new();
+        /// <summary>Candle flame positions (room frame) and size, drawn as animated flames each frame.</summary>
+        public readonly List<(Vector3 pos, float scale)> Candles = new();
+        /// <summary>Soft glow halos (bloom stand-in): position, radius, colour, follows the fire flicker.</summary>
+        public readonly List<(Vector3 pos, float radius, Color colour, bool fire)> Glows = new();
+        const float ChimW = 1.7f;
+
+        const float EaveH = 2.4f, RidgeH = 3.9f, LogR = 0.125f, LogStep = 0.24f;
+        float RoofY(float x) => Floor + EaveH + (RidgeH - EaveH) * Mathf.Clamp01(1f - Mathf.Abs(x) / RoomHalfW);
 
         // Light sources (room frame).
-        struct PointLight { public Vector3 Pos; public Color Col; public float Radius; public bool Lamp; }
+        struct PointLight { public Vector3 Pos; public Color Col; public float Radius; public bool Lamp, Fire, Window; public Vector3[] Samples; }
+        float fireOpenZ0, fireOpenZ1, fireOpenY1;
         readonly List<PointLight> lights = new();
         PointLight fire;
 
         public void Build(float d, float screenCy, float sw, float sh, float floorY)
         {
-            foreach (var p in Opaque) Object.Destroy(p.Mesh);
-            Opaque.Clear();
-            if (FireLight != null) Object.Destroy(FireLight);
+            // Opaque meshes and the fire light are replaced when the new lighting bake finishes (TryFinish).
+            foreach (var p in Outside) Object.Destroy(p.Mesh);
+            Outside.Clear();
+            bakeOcc.Clear(); recordOcc = true;
 
-            Floor = floorY; Ceil = floorY + 2.6f;
+            Floor = floorY; Ceil = floorY + RidgeH;
             RoomHalfW = 3.0f; ZBack = -2.6f; ZFront = d + 0.35f;
-            float F = Floor;
+            float F = Floor, W = RoomHalfW;
 
-            // ---- lights ----
+            // ---- openings and lights ----
             lights.Clear();
             Occluders.Clear();
-            // One floor lamp on the right (the fire lights the left side).
+            Candles.Clear();
+            Glows.Clear();
             var lampCol = new Color(1.0f, 0.60f, 0.28f) * 0.95f;
             float lampZ = ZFront - 0.35f;
             lights.Add(new PointLight { Pos = new Vector3(2.35f, F + 1.42f, lampZ), Col = lampCol, Radius = 1.1f, Lamp = true });
-            float fireZ = Mathf.Min(0.9f, ZFront - 1.2f);
-            WindowCenter = new Vector3(RoomHalfW, F + 1.55f, fireZ);
-            WindowW = 1.3f; WindowH = 1.25f;
-            lights.Add(new PointLight { Pos = WindowCenter + new Vector3(-0.3f, 0, 0), Col = new Color(0.10f, 0.14f, 0.30f) * 0.6f, Radius = 1.3f });
-            FireOpeningX = -RoomHalfW + 0.38f; FireOpeningZ = fireZ; FireOpeningY0 = F + 0.12f;
-            FirePos = new Vector3(-RoomHalfW + 0.2f, F + 0.32f, fireZ);
-            fire = new PointLight { Pos = new Vector3(FireOpeningX + 0.15f, F + 0.4f, fireZ), Col = new Color(1.0f, 0.42f, 0.12f) * 1.1f, Radius = 1.4f };
-            // Steady part of the fire's glow (the flicker mesh adds the rest).
-            lights.Add(new PointLight { Pos = fire.Pos, Col = fire.Col * 0.28f, Radius = fire.Radius });
+            var chandelierPos = new Vector3(0f, F + 2.75f, 0.2f);
+            var chandelierSamples = new Vector3[8];
+            for (int i = 0; i < 8; i++) { float a = i / 8f * Mathf.PI * 2f; chandelierSamples[i] = chandelierPos + new Vector3(Mathf.Cos(a) * 0.48f, 0.12f, Mathf.Sin(a) * 0.48f); }
+            lights.Add(new PointLight { Pos = chandelierPos, Col = new Color(1.0f, 0.62f, 0.30f) * 0.55f, Radius = 1.5f, Samples = chandelierSamples });
 
+            float fireZ = Mathf.Min(0.9f, ZFront - 1.2f);
+            WindowW = 2.3f; WindowH = 1.35f;
+            WindowCenter = new Vector3(W, F + 1.5f, Mathf.Min(0.25f, lampZ - 0.4f - WindowW / 2));
+            // Night skylight through the window (an area light over the opening, so the mullions cast shadows).
+            lights.Add(new PointLight { Pos = WindowCenter, Col = new Color(0.16f, 0.22f, 0.42f) * 1.1f, Radius = 2.2f, Window = true });
+
+            float chimX1 = -W + 0.5f;           // chimney front face
+            float openW = 0.85f, openH = 0.65f;
+            FireOpeningX = chimX1; FireOpeningZ = fireZ; FireOpeningY0 = F + 0.15f;
+            FirePos = new Vector3(chimX1 - 0.25f, F + 0.35f, fireZ);
+            // The fire sits inside the firebox; it only lights what it can see through the opening.
+            fire = new PointLight { Pos = new Vector3(chimX1 - 0.24f, F + 0.38f, fireZ), Col = new Color(1.0f, 0.42f, 0.12f) * 1.25f, Radius = 1.5f, Fire = true };
+            fireOpenZ0 = fireZ - openW / 2; fireOpenZ1 = fireZ + openW / 2; fireOpenY1 = FireOpeningY0 + openH;
+            Glows.Add((new Vector3(chimX1 + 0.02f, FireOpeningY0 + openH * 0.4f, fireZ), 0.55f, new Color(0.20f, 0.08f, 0.02f), true));
+            // Most of the fire light is baked (respects surface colours); only a smaller part flickers additively.
+            lights.Add(fire);
+
+            var doorRect = new Rect(0.95f, F, 1.0f, 2.05f);                 // back wall, x/y
+            var windowRect = new Rect(WindowCenter.z - WindowW / 2, WindowCenter.y - WindowH / 2, WindowW, WindowH); // right wall, z/y
+
+            // ---- builders (one per texture) ----
             var floorB = new MeshBuilder(this, RoomTextures.Wood);
             var wood = new MeshBuilder(this, RoomTextures.Wood);
-            var paper = new MeshBuilder(this, RoomTextures.Wallpaper);
+            var logs = new MeshBuilder(this, RoomTextures.Log);
             var plain = new MeshBuilder(this, RoomTextures.White);
             var rug = new MeshBuilder(this, RoomTextures.Rug);
-            var brick = new MeshBuilder(this, RoomTextures.Brick);
-            var sky = new MeshBuilder(this, RoomTextures.Sky);
+            var stone = new MeshBuilder(this, RoomTextures.Stone);
+            var plaid = new MeshBuilder(this, RoomTextures.Plaid);
+            var deck = new MeshBuilder(this, RoomTextures.Deck);
+            var sky = new MeshBuilder(this, RoomTextures.NightSky);
 
-            float W = RoomHalfW;
-            var warmWall = new Color(0.93f, 0.80f, 0.62f);
-            var accentWall = new Color(0.22f, 0.34f, 0.36f);
+            var timber = new Color(0.50f, 0.34f, 0.20f);
+            var pine = new Color(0.80f, 0.64f, 0.48f);
+            var chinking = new Color(0.55f, 0.48f, 0.38f);
+            var iron = new Color(0.07f, 0.06f, 0.06f);
 
-            // ---- shell ----
-            // Floor: planks run along z.
+            // ---- floor ----
             floorB.Grid(new Vector3(-W, F, ZBack), Vector3.right, Vector3.forward, 2 * W, ZFront - ZBack, Vector3.up,
-                      Color.white, uvScale: new Vector2(1f / 1.6f, 1f / 1.6f), swapUV: true, shell: true);
-            // Ceiling.
-            plain.Grid(new Vector3(-W, Ceil, ZFront), Vector3.right, Vector3.back, 2 * W, ZFront - ZBack, Vector3.down,
-                       new Color(0.90f, 0.84f, 0.74f), shell: true);
-            // Front (accent) wall behind the screen.
-            paper.Grid(new Vector3(W, F, ZFront), Vector3.left, Vector3.up, 2 * W, Ceil - F, Vector3.back,
-                       accentWall, uvScale: new Vector2(1 / 1.2f, 1 / 1.2f), shell: true);
-            // Back wall.
-            paper.Grid(new Vector3(-W, F, ZBack), Vector3.right, Vector3.up, 2 * W, Ceil - F, Vector3.forward,
-                       warmWall, uvScale: new Vector2(1 / 1.2f, 1 / 1.2f), shell: true);
-            // Left wall (fireplace).
-            paper.Grid(new Vector3(-W, F, ZFront), Vector3.back, Vector3.up, ZFront - ZBack, Ceil - F, Vector3.right,
-                       warmWall, uvScale: new Vector2(1 / 1.2f, 1 / 1.2f), shell: true);
-            // Right wall with the window hole.
-            var hole = new Rect(WindowCenter.z - WindowW / 2 - ZBack, WindowCenter.y - WindowH / 2 - F, WindowW, WindowH);
-            paper.Grid(new Vector3(W, F, ZBack), Vector3.forward, Vector3.up, ZFront - ZBack, Ceil - F, Vector3.left,
-                       warmWall, uvScale: new Vector2(1 / 1.2f, 1 / 1.2f), shell: true, hole: hole);
+                        new Color(0.85f, 0.78f, 0.70f), uvScale: new Vector2(1f / 1.8f, 1f / 1.8f), swapUV: true, shell: true, step: 0.06f);
 
-            // Ceiling beams across the room.
-            var beam = new Color(0.55f, 0.42f, 0.32f);
-            for (float z = ZBack + 0.6f; z < ZFront - 0.3f; z += 1.0f)
-                wood.Box(new Vector3(0, Ceil - 0.08f, z), new Vector3(2 * W, 0.16f, 0.14f), beam);
-            // Skirting boards.
-            var skirt = new Color(0.95f, 0.90f, 0.82f);
-            plain.Box(new Vector3(0, F + 0.05f, ZFront - 0.01f), new Vector3(2 * W, 0.1f, 0.02f), skirt);
-            plain.Box(new Vector3(0, F + 0.05f, ZBack + 0.01f), new Vector3(2 * W, 0.1f, 0.02f), skirt);
-            plain.Box(new Vector3(-W + 0.01f, F + 0.05f, (ZFront + ZBack) / 2), new Vector3(0.02f, 0.1f, ZFront - ZBack), skirt);
-            plain.Box(new Vector3(W - 0.01f, F + 0.05f, (ZFront + ZBack) / 2), new Vector3(0.02f, 0.1f, ZFront - ZBack), skirt);
+            // ---- log walls (left, right, back), chinking behind them ----
+            float logTop = F + EaveH;
+            plain.Grid(new Vector3(-W, F, ZFront), Vector3.back, Vector3.up, ZFront - ZBack, EaveH, Vector3.right, chinking, shell: true);
+            plain.Grid(new Vector3(W, F, ZBack), Vector3.forward, Vector3.up, ZFront - ZBack, EaveH, Vector3.left, chinking, shell: true,
+                       hole: new Rect(windowRect.x - ZBack, windowRect.y - F, windowRect.width, windowRect.height));
+            plain.Grid(new Vector3(-W, F, ZBack), Vector3.right, Vector3.up, 2 * W, EaveH, Vector3.forward, chinking, shell: true,
+                       hole: new Rect(doorRect.x + W, doorRect.y - F, doorRect.width, doorRect.height));
+            int row = 0;
+            for (float y = F + LogStep / 2; y < logTop - 0.05f; y += LogStep, row++)
+            {
+                var tone = pine * (0.92f + 0.08f * ((row * 37) % 5) / 4f);
+                // Left wall: logs along z.
+                // Left wall: logs along z, cut where the chimney stands (they would show inside the firebox).
+                logs.LogRun(new Vector3(-W, y, ZBack), new Vector3(-W, y, fireZ - ChimW / 2), Vector3.right, LogR, tone);
+                logs.LogRun(new Vector3(-W, y, fireZ + ChimW / 2), new Vector3(-W, y, ZFront), Vector3.right, LogR, tone);
+                // Right wall: split around the window.
+                if (y + LogR > windowRect.yMin && y - LogR < windowRect.yMax)
+                {
+                    logs.LogRun(new Vector3(W, y, ZBack), new Vector3(W, y, windowRect.xMin), Vector3.left, LogR, tone);
+                    logs.LogRun(new Vector3(W, y, windowRect.xMax), new Vector3(W, y, ZFront), Vector3.left, LogR, tone);
+                }
+                else logs.LogRun(new Vector3(W, y, ZBack), new Vector3(W, y, ZFront), Vector3.left, LogR, tone);
+                // Back wall: logs along x, split around the door.
+                if (y - LogR < doorRect.yMax)
+                {
+                    logs.LogRun(new Vector3(-W, y, ZBack), new Vector3(doorRect.xMin, y, ZBack), Vector3.forward, LogR, tone);
+                    logs.LogRun(new Vector3(doorRect.xMax, y, ZBack), new Vector3(W, y, ZBack), Vector3.forward, LogR, tone);
+                }
+                else logs.LogRun(new Vector3(-W, y, ZBack), new Vector3(W, y, ZBack), Vector3.forward, LogR, tone);
+            }
+
+            // ---- plank walls: the feature wall behind the TV (full gable) and the back gable ----
+            System.Func<Vector3, Vector3> underRoof = p => new Vector3(p.x, Mathf.Min(p.y, RoofY(p.x)), p.z);
+            wood.Grid(new Vector3(W, F, ZFront), Vector3.left, Vector3.up, 2 * W, RidgeH, Vector3.back,
+                      new Color(0.55f, 0.40f, 0.30f), uvScale: new Vector2(1 / 1.4f, 1 / 1.4f), swapUV: true, shell: true, warp: underRoof, step: 0.07f);
+            wood.Grid(new Vector3(-W, logTop, ZBack + 0.01f), Vector3.right, Vector3.up, 2 * W, RidgeH - EaveH, Vector3.forward,
+                      pine * 0.85f, uvScale: new Vector2(1 / 1.4f, 1 / 1.4f), swapUV: true, shell: true, warp: underRoof);
+
+            // ---- pitched roof with boards, ridge beam and trusses ----
+            float rise = RidgeH - EaveH, slopeLen = Mathf.Sqrt(W * W + rise * rise);
+            var slopeL = new Vector3(W, rise, 0) / slopeLen;          // up the left slope
+            var slopeR = new Vector3(-W, rise, 0) / slopeLen;         // up the right slope
+            wood.Grid(new Vector3(-W, F + EaveH, ZBack), Vector3.forward, slopeL, ZFront - ZBack, slopeLen,
+                      new Vector3(rise, -W, 0).normalized, pine * 0.9f, uvScale: new Vector2(1 / 2.2f, 1 / 2.2f), shell: true);
+            wood.Grid(new Vector3(W, F + EaveH, ZBack), Vector3.forward, slopeR, ZFront - ZBack, slopeLen,
+                      new Vector3(-rise, -W, 0).normalized, pine * 0.9f, uvScale: new Vector2(1 / 2.2f, 1 / 2.2f), shell: true);
+            logs.Box(new Vector3(0, F + RidgeH - 0.14f, (ZFront + ZBack) / 2), new Vector3(0.2f, 0.26f, ZFront - ZBack), timber);
+            float angle = Mathf.Atan2(rise, W) * Mathf.Rad2Deg;
+            for (float z = ZBack + 0.9f; z < ZFront - 0.5f; z += 1.6f)
+            {
+                // Tie beam at eave height, king post, and a rafter under each slope.
+                logs.Box(new Vector3(0, F + EaveH - 0.09f, z), new Vector3(2 * W, 0.18f, 0.16f), timber);
+                logs.Box(new Vector3(0, F + EaveH + rise / 2, z), new Vector3(0.14f, rise, 0.14f), timber);
+                var midL = new Vector3(-W / 2, F + EaveH + rise / 2, z) + new Vector3(rise, -W, 0).normalized * 0.11f;
+                var midR = new Vector3(W / 2, F + EaveH + rise / 2, z) + new Vector3(-rise, -W, 0).normalized * 0.11f;
+                logs.BoxRotated(midL, new Vector3(slopeLen, 0.2f, 0.15f), Quaternion.Euler(0, 0, angle), timber);
+                logs.BoxRotated(midR, new Vector3(slopeLen, 0.2f, 0.15f), Quaternion.Euler(0, 0, -angle), timber);
+                // Angled braces from the king post to the tie beam.
+                logs.BoxRotated(new Vector3(-0.45f, F + EaveH + 0.35f, z), new Vector3(1.0f, 0.1f, 0.1f), Quaternion.Euler(0, 0, 40f), timber * 0.95f);
+                logs.BoxRotated(new Vector3(0.45f, F + EaveH + 0.35f, z), new Vector3(1.0f, 0.1f, 0.1f), Quaternion.Euler(0, 0, -40f), timber * 0.95f);
+            }
 
             // ---- rug ----
             float rugZ = Mathf.Lerp(0f, ZFront - 0.5f, 0.45f);
             rug.Quad(new Vector3(-1.5f, F + 0.006f, rugZ - 1.0f), new Vector3(1.5f, F + 0.006f, rugZ - 1.0f),
                      new Vector3(1.5f, F + 0.006f, rugZ + 1.0f), new Vector3(-1.5f, F + 0.006f, rugZ + 1.0f),
-                     Vector3.up, Color.white, new Vector2(0, 0), new Vector2(1, 0), new Vector2(1, 1), new Vector2(0, 1), subdiv: 10);
+                     Vector3.up, Color.white, new Vector2(0, 0), new Vector2(1, 0), new Vector2(1, 1), new Vector2(0, 1), subdiv: 48);
 
             // ---- TV around the screen (the screen image is the TV's panel) ----
             float screenBottom = screenCy - sh / 2;
@@ -133,19 +201,19 @@ namespace OlliVR
                 foreach (var lz in new[] { zf + 0.06f, zb - 0.06f })
                     plain.Cylinder(new Vector3(lx, F, lz), 0.013f, 0.022f, LegH, new Color(0.28f, 0.18f, 0.11f), 10);
             // Carcass: top, bottom, sides, back.
-            wood.Box(new Vector3(0, y1 - T / 2, cabZ), new Vector3(cabW, T, Dc), cabCol);
-            wood.Box(new Vector3(0, y0 + T / 2, cabZ), new Vector3(cabW, T, Dc), cabCol);
-            wood.Box(new Vector3(-hw + T / 2, (y0 + y1) / 2, cabZ), new Vector3(T, cabH, Dc), cabCol);
-            wood.Box(new Vector3(hw - T / 2, (y0 + y1) / 2, cabZ), new Vector3(T, cabH, Dc), cabCol);
-            wood.Box(new Vector3(0, (y0 + y1) / 2, zb - 0.005f), new Vector3(cabW - 2 * T, cabH - 2 * T, 0.01f), cabInside);
+            logs.Box(new Vector3(0, y1 - T / 2, cabZ), new Vector3(cabW, T, Dc), cabCol);
+            logs.Box(new Vector3(0, y0 + T / 2, cabZ), new Vector3(cabW, T, Dc), cabCol);
+            logs.Box(new Vector3(-hw + T / 2, (y0 + y1) / 2, cabZ), new Vector3(T, cabH, Dc), cabCol);
+            logs.Box(new Vector3(hw - T / 2, (y0 + y1) / 2, cabZ), new Vector3(T, cabH, Dc), cabCol);
+            logs.Box(new Vector3(0, (y0 + y1) / 2, zb - 0.005f), new Vector3(cabW - 2 * T, cabH - 2 * T, 0.01f), cabInside);
             Occluders.Add(new Bounds(new Vector3(0, (y0 + y1) / 2, cabZ), new Vector3(cabW, cabH, Dc)));
             // Two dividers make three compartments.
             float xd1 = -cabW / 6, xd2 = cabW / 6;
-            wood.Box(new Vector3(xd1, (y0 + y1) / 2, cabZ + 0.01f), new Vector3(T, cabH - 2 * T, Dc - 0.02f), cabCol * 0.9f);
-            wood.Box(new Vector3(xd2, (y0 + y1) / 2, cabZ + 0.01f), new Vector3(T, cabH - 2 * T, Dc - 0.02f), cabCol * 0.9f);
+            logs.Box(new Vector3(xd1, (y0 + y1) / 2, cabZ + 0.01f), new Vector3(T, cabH - 2 * T, Dc - 0.02f), cabCol * 0.9f);
+            logs.Box(new Vector3(xd2, (y0 + y1) / 2, cabZ + 0.01f), new Vector3(T, cabH - 2 * T, Dc - 0.02f), cabCol * 0.9f);
             // Left compartment: a closed door with a brass knob.
             float doorX0 = -hw + T + 0.004f, doorX1 = xd1 - T / 2 - 0.004f;
-            wood.Box(new Vector3((doorX0 + doorX1) / 2, (y0 + y1) / 2, zf + 0.01f), new Vector3(doorX1 - doorX0, cabH - 2 * T - 0.008f, 0.02f), cabCol * 1.08f);
+            logs.Box(new Vector3((doorX0 + doorX1) / 2, (y0 + y1) / 2, zf + 0.01f), new Vector3(doorX1 - doorX0, cabH - 2 * T - 0.008f, 0.02f), cabCol * 1.08f);
             plain.Sphere(new Vector3(doorX1 - 0.06f, (y0 + y1) / 2, zf - 0.008f), 0.014f, new Color(0.75f, 0.58f, 0.25f));
             // Middle compartment: a game console with a glowing light strip.
             float midY = y0 + T;
@@ -184,6 +252,7 @@ namespace OlliVR
             var potPos = new Vector3(-hw - 0.32f, F, cabZ - 0.05f);
             var potCol = new Color(0.88f, 0.84f, 0.76f);
             Occluders.Add(new Bounds(potPos + new Vector3(0, 0.195f, 0), new Vector3(0.32f, 0.39f, 0.32f)));
+            AddOcc(potPos + new Vector3(0, 0.195f, 0), new Vector3(0.28f, 0.39f, 0.28f));
             plain.Cylinder(potPos, 0.13f, 0.17f, 0.36f, potCol, 24);
             plain.Cylinder(potPos + new Vector3(0, 0.36f, 0), 0.178f, 0.178f, 0.03f, potCol * 0.95f, 24, open: true);
             plain.Cylinder(potPos + new Vector3(0, 0.33f, 0), 0.165f, 0.165f, 0.005f, new Color(0.18f, 0.12f, 0.08f), 24);
@@ -213,126 +282,322 @@ namespace OlliVR
                 // Bright inside, seen through the openings.
                 plain.Cylinder(shadeBase, 0.214f, 0.194f, 0.34f, new Color(1.0f, 0.82f, 0.55f), 24, emissive: true, open: true, inward: true);
                 plain.Sphere(l.Pos, 0.035f, new Color(1f, 0.95f, 0.85f), emissive: true);
+                Glows.Add((l.Pos + new Vector3(0, 0.19f, 0), 0.26f, new Color(0.12f, 0.08f, 0.035f), false));
+                Glows.Add((l.Pos - new Vector3(0, 0.19f, 0), 0.22f, new Color(0.10f, 0.065f, 0.03f), false));
             }
 
-            // ---- fireplace (left wall) ----
-            float fx0 = -W, fx1 = FireOpeningX, fz = fireZ;
-            float fw = 1.5f, fh = 1.15f, ow = 0.8f, oh = 0.6f, oy0 = FireOpeningY0;
-            var brickCol = Color.white;
-            // Front face with the opening (4 pieces), sides and top of the surround.
-            brick.Face(new Vector3(fx1, F, fz - fw / 2), new Vector3(fx1, fh + F, fz - ow / 2), Vector3.right, brickCol, 0.8f);
-            brick.Face(new Vector3(fx1, F, fz + ow / 2), new Vector3(fx1, fh + F, fz + fw / 2), Vector3.right, brickCol, 0.8f);
-            brick.Face(new Vector3(fx1, F, fz - ow / 2), new Vector3(fx1, oy0, fz + ow / 2), Vector3.right, brickCol, 0.8f);
-            brick.Face(new Vector3(fx1, oy0 + oh, fz - ow / 2), new Vector3(fx1, F + fh, fz + ow / 2), Vector3.right, brickCol, 0.8f);
-            brick.Box(new Vector3((fx0 + fx1) / 2, F + fh / 2, fz - fw / 2 - 0.001f), new Vector3(fx1 - fx0, fh, 0.002f), brickCol, onlyFaces: BoxFaces.Back);
-            brick.Box(new Vector3((fx0 + fx1) / 2, F + fh / 2, fz + fw / 2 + 0.001f), new Vector3(fx1 - fx0, fh, 0.002f), brickCol, onlyFaces: BoxFaces.Front);
+            // ---- river-stone chimney and fireplace (left wall) ----
+            float cx0 = -W, cx1 = chimX1, fz = fireZ, cw = ChimW;
+            float chimTop = RoofY(cx1) + 0.4f;
+            float oy0 = FireOpeningY0;
+            var stoneCol = Color.white;
+            // Shadow-casting volume of the chimney: two pillars and the mass above the opening (the firebox stays open).
+            AddOcc(new Vector3((cx0 + cx1) / 2, (F + chimTop) / 2, fz - (cw + openW) / 4), new Vector3(cx1 - cx0, chimTop - F, (cw - openW) / 2));
+            AddOcc(new Vector3((cx0 + cx1) / 2, (F + chimTop) / 2, fz + (cw + openW) / 4), new Vector3(cx1 - cx0, chimTop - F, (cw - openW) / 2));
+            AddOcc(new Vector3((cx0 + cx1) / 2, (oy0 + openH + chimTop) / 2, fz), new Vector3(cx1 - cx0, chimTop - oy0 - openH, openW));
+            // One continuous front with a hole for the opening (no seams between pieces).
+            stone.StoneFace(new Vector3(cx1, F, fz - cw / 2), new Vector3(cx1, chimTop, fz + cw / 2), Vector3.right, stoneCol, 1.1f,
+                            hole: new Rect(fz - openW / 2, oy0, openW, openH));
+            stone.StoneFace(new Vector3(cx0, F, fz - cw / 2), new Vector3(cx1, chimTop, fz - cw / 2), Vector3.back, stoneCol, 1.1f);
+            stone.StoneFace(new Vector3(cx0, F, fz + cw / 2), new Vector3(cx1, chimTop, fz + cw / 2), Vector3.forward, stoneCol, 1.1f);
             // Firebox interior (sooty).
-            var soot = new Color(0.10f, 0.07f, 0.06f);
-            float inner = fx0 + 0.04f;
-            plain.Face(new Vector3(inner, oy0, fz - ow / 2), new Vector3(inner, oy0 + oh, fz + ow / 2), Vector3.right, soot, 1f);
-            plain.Quad(new Vector3(inner, oy0, fz - ow / 2), new Vector3(fx1, oy0, fz - ow / 2), new Vector3(fx1, oy0 + oh, fz - ow / 2), new Vector3(inner, oy0 + oh, fz - ow / 2), Vector3.forward, soot);
-            plain.Quad(new Vector3(inner, oy0, fz + ow / 2), new Vector3(inner, oy0 + oh, fz + ow / 2), new Vector3(fx1, oy0 + oh, fz + ow / 2), new Vector3(fx1, oy0, fz + ow / 2), Vector3.back, soot);
-            plain.Quad(new Vector3(inner, oy0 + oh, fz - ow / 2), new Vector3(fx1, oy0 + oh, fz - ow / 2), new Vector3(fx1, oy0 + oh, fz + ow / 2), new Vector3(inner, oy0 + oh, fz + ow / 2), Vector3.down, soot);
-            plain.Quad(new Vector3(inner, oy0, fz - ow / 2), new Vector3(inner, oy0, fz + ow / 2), new Vector3(fx1, oy0, fz + ow / 2), new Vector3(fx1, oy0, fz - ow / 2), Vector3.up, soot * 1.5f);
-            // Logs and glowing embers.
+            var soot = new Color(0.30f, 0.26f, 0.24f); // sooty stone lining
+            float inner = cx0 + 0.06f;
+            stone.Face(new Vector3(inner, oy0, fz - openW / 2), new Vector3(inner, oy0 + openH, fz + openW / 2), Vector3.right, soot, 1f);
+            stone.Quad(new Vector3(inner, oy0, fz - openW / 2), new Vector3(cx1, oy0, fz - openW / 2), new Vector3(cx1, oy0 + openH, fz - openW / 2), new Vector3(inner, oy0 + openH, fz - openW / 2), Vector3.forward, soot);
+            stone.Quad(new Vector3(inner, oy0, fz + openW / 2), new Vector3(inner, oy0 + openH, fz + openW / 2), new Vector3(cx1, oy0 + openH, fz + openW / 2), new Vector3(cx1, oy0, fz + openW / 2), Vector3.back, soot);
+            stone.Quad(new Vector3(inner, oy0 + openH, fz - openW / 2), new Vector3(cx1, oy0 + openH, fz - openW / 2), new Vector3(cx1, oy0 + openH, fz + openW / 2), new Vector3(inner, oy0 + openH, fz + openW / 2), Vector3.down, soot);
+            stone.Quad(new Vector3(inner, oy0, fz - openW / 2), new Vector3(inner, oy0, fz + openW / 2), new Vector3(cx1, oy0, fz + openW / 2), new Vector3(cx1, oy0, fz - openW / 2), Vector3.up, soot * 1.5f);
             var logCol = new Color(0.30f, 0.18f, 0.10f);
-            plain.LogZ(new Vector3(fx0 + 0.20f, oy0 + 0.06f, fz), 0.055f, 0.6f, logCol);
-            plain.LogZ(new Vector3(fx0 + 0.28f, oy0 + 0.06f, fz + 0.05f), 0.05f, 0.5f, logCol * 0.9f);
-            plain.Box(new Vector3(fx0 + 0.24f, oy0 + 0.012f, fz), new Vector3(0.28f, 0.02f, 0.55f), new Color(1.0f, 0.35f, 0.08f), emissive: true);
-            // Mantel and hearth.
-            wood.Box(new Vector3((fx0 + fx1 + 0.08f) / 2, F + fh + 0.04f, fz), new Vector3(fx1 - fx0 + 0.08f, 0.08f, fw + 0.2f), new Color(0.55f, 0.38f, 0.26f));
-            plain.Box(new Vector3((fx0 + fx1 + 0.25f) / 2, F + 0.02f, fz), new Vector3(fx1 - fx0 + 0.25f, 0.04f, fw + 0.2f), new Color(0.45f, 0.42f, 0.40f));
-            // Candles on the mantel.
+            plain.LogZ(new Vector3(cx0 + 0.24f, oy0 + 0.06f, fz), 0.055f, 0.6f, logCol);
+            plain.LogZ(new Vector3(cx0 + 0.32f, oy0 + 0.06f, fz + 0.05f), 0.05f, 0.5f, logCol * 0.9f);
+            plain.Box(new Vector3(cx0 + 0.28f, oy0 + 0.012f, fz), new Vector3(0.3f, 0.02f, 0.6f), new Color(1.0f, 0.35f, 0.08f), emissive: true);
+            // Hearth slab and a rough timber mantel with candles and a lantern.
+            stone.Box(new Vector3((cx0 + cx1 + 0.4f) / 2, F + 0.03f, fz), new Vector3(cx1 - cx0 + 0.4f, 0.06f, cw + 0.3f), stoneCol * 0.85f);
+            float mantelY = F + 1.2f;
+            logs.Box(new Vector3((cx0 + cx1 + 0.14f) / 2, mantelY, fz), new Vector3(cx1 - cx0 + 0.14f, 0.14f, cw + 0.25f), timber);
+            for (int i = -1; i <= 1; i += 2)
+            {
+                var cp = new Vector3(cx1 + 0.075f, mantelY + 0.07f, fz + i * 0.6f); // in front of the stones
+                float ch = 0.14f + 0.04f * (i + 1);
+                plain.Cylinder(cp, 0.035f, 0.035f, ch, new Color(0.95f, 0.90f, 0.80f), 10);
+                plain.Cylinder(cp + new Vector3(0, ch, 0), 0.0035f, 0.0035f, 0.012f, new Color(0.08f, 0.06f, 0.05f), 6);
+                AddCandle(cp + new Vector3(0, ch + 0.012f, 0), 1f, 0.35f);
+            }
+            Lantern(plain, new Vector3(cx1 + 0.07f, mantelY + 0.07f, fz + 0.15f), iron);
+            // Firewood stacked beside the chimney.
+            var rngW = new System.Random(11);
+            AddOcc(new Vector3(-W + LogR + 0.27f, F + 0.25f, fz + cw / 2 + 0.35f), new Vector3(0.5f, 0.5f, 0.48f));
+            float wz = fz + cw / 2 + 0.32f;
+            for (int r = 0; r < 4; r++)
+                for (int i = 0; i < 4 - r; i++)
+                {
+                    float lx = -W + LogR + 0.08f + i * 0.13f + r * 0.065f, ly = F + 0.065f + r * 0.115f;
+                    var lc = new Color(0.42f, 0.28f, 0.17f) * (0.8f + 0.4f * (float)rngW.NextDouble());
+                    plain.LogZ(new Vector3(lx, ly, wz + 0.03f * ((i + r) % 2)), 0.062f, 0.48f, lc);
+                }
+
+            // ---- wrought-iron chandelier under the ridge ----
+            float ringR = 0.48f;
+            plain.Cylinder(chandelierPos - new Vector3(0, 0.02f, 0), ringR, ringR, 0.04f, iron, 32, open: true);
+            plain.Box(chandelierPos, new Vector3(2 * ringR, 0.018f, 0.018f), iron);
+            plain.Box(chandelierPos, new Vector3(0.018f, 0.018f, 2 * ringR), iron);
+            plain.Box(new Vector3(0, (chandelierPos.y + F + RidgeH - 0.27f) / 2, chandelierPos.z), new Vector3(0.02f, F + RidgeH - 0.27f - chandelierPos.y, 0.02f), iron);
+            for (int i = 0; i < 8; i++)
+            {
+                float a = i / 8f * Mathf.PI * 2f;
+                var cp = chandelierPos + new Vector3(Mathf.Cos(a), 0, Mathf.Sin(a)) * ringR + new Vector3(0, 0.02f, 0);
+                plain.Cylinder(cp - new Vector3(0, 0.005f, 0), 0.03f, 0.03f, 0.01f, iron, 10);
+                plain.Cylinder(cp, 0.018f, 0.018f, 0.09f, new Color(0.95f, 0.90f, 0.80f), 8);
+                plain.Cylinder(cp + new Vector3(0, 0.09f, 0), 0.003f, 0.003f, 0.01f, new Color(0.08f, 0.06f, 0.05f), 6);
+                AddCandle(cp + new Vector3(0, 0.10f, 0), 0.8f, 0f); // the chandelier light covers these
+            }
+
+            // ---- armchair with a plaid blanket, back left facing the fire and TV ----
+            var leather = new Color(0.42f, 0.22f, 0.12f);
+            var chair = new Vector3(-1.75f, F, -1.45f);
+            plain.Box(chair + new Vector3(0, 0.2f, 0), new Vector3(0.85f, 0.26f, 0.8f), leather * 0.8f, bevel: 0.06f);
+            plain.Box(chair + new Vector3(0, 0.39f, 0.04f), new Vector3(0.62f, 0.12f, 0.7f), leather, bevel: 0.06f);
+            plain.Box(chair + new Vector3(0, 0.72f, -0.33f), new Vector3(0.85f, 0.68f, 0.16f), leather, bevel: 0.06f);
+            plain.Box(chair + new Vector3(-0.36f, 0.5f, 0.02f), new Vector3(0.14f, 0.3f, 0.78f), leather * 0.95f, bevel: 0.06f);
+            plain.Box(chair + new Vector3(0.36f, 0.5f, 0.02f), new Vector3(0.14f, 0.3f, 0.78f), leather * 0.95f, bevel: 0.06f);
+            foreach (var fx in new[] { -0.36f, 0.36f })
+                foreach (var fzz in new[] { -0.34f, 0.34f })
+                    plain.Box(chair + new Vector3(fx, 0.035f, fzz), new Vector3(0.06f, 0.07f, 0.06f), timber * 0.6f);
+            plaid.Box(chair + new Vector3(0.1f, 0.78f, -0.235f), new Vector3(0.55f, 0.62f, 0.025f), Color.white);
+            plaid.Box(chair + new Vector3(0.1f, 0.47f, 0.05f), new Vector3(0.55f, 0.025f, 0.55f), Color.white);
+
+            // ---- door (back wall), coat rack and skateboard ----
+            float dz = ZBack + 0.04f;
+            var doorCol = new Color(0.62f, 0.42f, 0.27f);
+            wood.Grid(new Vector3(doorRect.xMin, F, dz), Vector3.right, Vector3.up, doorRect.width, doorRect.height, Vector3.forward,
+                      doorCol, uvScale: new Vector2(1 / 1.1f, 1 / 1.1f), swapUV: true);
+            logs.Box(new Vector3(doorRect.center.x, F + 0.35f, dz + 0.02f), new Vector3(doorRect.width - 0.08f, 0.14f, 0.035f), doorCol * 0.85f);
+            logs.Box(new Vector3(doorRect.center.x, F + 1.7f, dz + 0.02f), new Vector3(doorRect.width - 0.08f, 0.14f, 0.035f), doorCol * 0.85f);
+            float braceLen = Mathf.Sqrt((doorRect.width - 0.2f) * (doorRect.width - 0.2f) + 1.35f * 1.35f);
+            logs.BoxRotated(new Vector3(doorRect.center.x, F + 1.025f, dz + 0.02f), new Vector3(braceLen, 0.12f, 0.03f),
+                            Quaternion.Euler(0, 0, Mathf.Atan2(1.35f, doorRect.width - 0.2f) * Mathf.Rad2Deg), doorCol * 0.85f);
+            foreach (var hy in new[] { F + 0.35f, F + 1.7f })
+                plain.Box(new Vector3(doorRect.xMin + 0.22f, hy, dz + 0.045f), new Vector3(0.4f, 0.05f, 0.008f), iron);
+            plain.Box(new Vector3(doorRect.xMax - 0.12f, F + 1.0f, dz + 0.03f), new Vector3(0.03f, 0.16f, 0.02f), iron);
+            plain.Sphere(new Vector3(doorRect.xMax - 0.12f, F + 1.0f, dz + 0.06f), 0.025f, iron * 1.5f);
+            // Heavy timber frame around the door, covering the log ends.
+            float fd = LogR + 0.05f;
+            logs.Box(new Vector3(doorRect.xMin - 0.07f, F + (doorRect.height + 0.14f) / 2, ZBack + fd / 2), new Vector3(0.14f, doorRect.height + 0.14f, fd), timber);
+            logs.Box(new Vector3(doorRect.xMax + 0.07f, F + (doorRect.height + 0.14f) / 2, ZBack + fd / 2), new Vector3(0.14f, doorRect.height + 0.14f, fd), timber);
+            logs.Box(new Vector3(doorRect.center.x, F + doorRect.height + 0.07f, ZBack + fd / 2), new Vector3(doorRect.width + 0.28f, 0.14f, fd), timber);
+            // Coat rack right of the door with a scarf and a beanie.
+            float rackX = doorRect.xMax + 0.55f, rackY = F + 1.65f, rackZ = ZBack + LogR + 0.02f;
+            logs.Box(new Vector3(rackX, rackY, rackZ), new Vector3(0.55f, 0.1f, 0.03f), timber * 1.1f);
             for (int i = -1; i <= 1; i++)
-            {
-                var cp = new Vector3(fx1 - 0.18f, F + fh + 0.08f, fz + i * 0.45f);
-                float ch = 0.10f + 0.04f * (i + 1);
-                plain.Cylinder(cp, 0.03f, 0.03f, ch, new Color(0.95f, 0.90f, 0.80f), 10);
-                plain.Sphere(cp + new Vector3(0, ch + 0.025f, 0), 0.016f, new Color(1f, 0.8f, 0.4f), emissive: true);
-            }
+                plain.Box(new Vector3(rackX + i * 0.17f, rackY, rackZ + 0.06f), new Vector3(0.025f, 0.025f, 0.1f), iron);
+            plaid.Box(new Vector3(rackX - 0.17f, rackY - 0.3f, rackZ + 0.09f), new Vector3(0.14f, 0.6f, 0.025f), Color.white);
+            plain.Sphere(new Vector3(rackX + 0.17f, rackY - 0.04f, rackZ + 0.12f), 0.095f, new Color(0.15f, 0.40f, 0.42f));
+            // Skateboard leaning on the logs left of the door, graphic towards the room.
+            BuildSkateboard(plain, deck, new Vector3(doorRect.xMin - 0.55f, F, ZBack + LogR + 0.23f));
 
-            // ---- window (right wall) ----
-            float wz0 = WindowCenter.z - WindowW / 2, wz1 = WindowCenter.z + WindowW / 2;
-            float wy0 = WindowCenter.y - WindowH / 2, wy1 = WindowCenter.y + WindowH / 2;
-            float depth = 0.18f;
-            var jamb = new Color(0.92f, 0.88f, 0.80f);
-            plain.Quad(new Vector3(W, wy0, wz0), new Vector3(W + depth, wy0, wz0), new Vector3(W + depth, wy1, wz0), new Vector3(W, wy1, wz0), Vector3.forward, jamb);
-            plain.Quad(new Vector3(W, wy0, wz1), new Vector3(W, wy1, wz1), new Vector3(W + depth, wy1, wz1), new Vector3(W + depth, wy0, wz1), Vector3.back, jamb);
-            plain.Quad(new Vector3(W, wy1, wz0), new Vector3(W + depth, wy1, wz0), new Vector3(W + depth, wy1, wz1), new Vector3(W, wy1, wz1), Vector3.down, jamb);
-            plain.Quad(new Vector3(W, wy0, wz0), new Vector3(W, wy0, wz1), new Vector3(W + depth, wy0, wz1), new Vector3(W + depth, wy0, wz0), Vector3.up, jamb);
-            var frame = new Color(0.70f, 0.55f, 0.40f);
-            float fxw = W + depth * 0.6f;
-            wood.Box(new Vector3(fxw, WindowCenter.y, WindowCenter.z), new Vector3(0.04f, WindowH, 0.05f), frame);
-            wood.Box(new Vector3(fxw, WindowCenter.y, WindowCenter.z), new Vector3(0.04f, 0.05f, WindowW), frame);
-            wood.Box(new Vector3(W - 0.07f, wy0 - 0.025f, WindowCenter.z), new Vector3(0.16f, 0.05f, WindowW + 0.2f), frame);
-            // Trim around the window on the wall.
-            wood.Box(new Vector3(W - 0.01f, wy1 + 0.04f, WindowCenter.z), new Vector3(0.02f, 0.08f, WindowW + 0.16f), frame);
-            wood.Box(new Vector3(W - 0.01f, WindowCenter.y, wz0 - 0.04f), new Vector3(0.02f, WindowH, 0.08f), frame);
-            wood.Box(new Vector3(W - 0.01f, WindowCenter.y, wz1 + 0.04f), new Vector3(0.02f, WindowH, 0.08f), frame);
-            // Night sky far outside.
-            float sx = W + 4.0f;
-            sky.Quad(new Vector3(sx, F - 0.3f, WindowCenter.z - 6f), new Vector3(sx, F - 0.3f, WindowCenter.z + 6f),
-                     new Vector3(sx, F + 4.7f, WindowCenter.z + 6f), new Vector3(sx, F + 4.7f, WindowCenter.z - 6f),
+            // ---- big window (right wall) ----
+            float wz0 = windowRect.xMin, wz1 = windowRect.xMax, wy0 = windowRect.yMin, wy1 = windowRect.yMax;
+            float jamb0 = W - LogR - 0.03f, jamb1 = W + 0.12f;
+            plain.Quad(new Vector3(jamb0, wy0, wz0), new Vector3(jamb1, wy0, wz0), new Vector3(jamb1, wy1, wz0), new Vector3(jamb0, wy1, wz0), Vector3.forward, pine * 0.8f);
+            plain.Quad(new Vector3(jamb0, wy0, wz1), new Vector3(jamb0, wy1, wz1), new Vector3(jamb1, wy1, wz1), new Vector3(jamb1, wy0, wz1), Vector3.back, pine * 0.8f);
+            plain.Quad(new Vector3(jamb0, wy1, wz0), new Vector3(jamb1, wy1, wz0), new Vector3(jamb1, wy1, wz1), new Vector3(jamb0, wy1, wz1), Vector3.down, pine * 0.8f);
+            plain.Quad(new Vector3(jamb0, wy0, wz0), new Vector3(jamb0, wy0, wz1), new Vector3(jamb1, wy0, wz1), new Vector3(jamb1, wy0, wz0), Vector3.up, pine * 0.8f);
+            float fxw = W + 0.06f;
+            for (int i = 1; i <= 2; i++)
+                logs.Box(new Vector3(fxw, WindowCenter.y, wz0 + WindowW * i / 3f), new Vector3(0.05f, WindowH, 0.06f), timber);
+            logs.Box(new Vector3(fxw, wy0 + WindowH * 0.7f, WindowCenter.z), new Vector3(0.05f, 0.05f, WindowW), timber);
+            // Timber trim around the opening covering the log ends, and a deep sill with a lantern.
+            float trimX = W - LogR - 0.04f;
+            logs.Box(new Vector3(trimX, wy1 + 0.07f, WindowCenter.z), new Vector3(0.08f, 0.14f, WindowW + 0.28f), timber);
+            logs.Box(new Vector3(trimX, WindowCenter.y, wz0 - 0.07f), new Vector3(0.08f, WindowH, 0.14f), timber);
+            logs.Box(new Vector3(trimX, WindowCenter.y, wz1 + 0.07f), new Vector3(0.08f, WindowH, 0.14f), timber);
+            logs.Box(new Vector3(W - LogR - 0.06f, wy0 - 0.03f, WindowCenter.z), new Vector3(0.3f, 0.06f, WindowW + 0.3f), timber);
+            Lantern(plain, new Vector3(W - LogR - 0.1f, wy0, wz1 - 0.3f), iron);
+
+            // ---- the view: sky (opaque) and parallax layers far to near ----
+            var wc = WindowCenter;
+            sky.Quad(new Vector3(W + 45f, F - 15f, wc.z - 45f), new Vector3(W + 45f, F - 15f, wc.z + 45f),
+                     new Vector3(W + 45f, F + 45f, wc.z + 45f), new Vector3(W + 45f, F + 45f, wc.z - 45f),
                      Vector3.left, Color.white, new Vector2(0, 0), new Vector2(1, 0), new Vector2(1, 1), new Vector2(0, 1), emissive: true);
+            AddLayer(RoomTextures.Mountains, W + 32f, wc.z, 30f, F - 4f, F + 14f);
+            AddLayer(RoomTextures.Forest, W + 16f, wc.z, 16f, F - 2f, F + 6f);
+            AddLayer(RoomTextures.NearTrees, W + 6f, wc.z, 9f, F - 1.2f, F + 7.8f);
 
-            foreach (var b in new[] { floorB, wood, paper, plain, rug, brick, sky })
-                if (b.Count > 0) Opaque.Add(new Part { Mesh = b.ToMesh(false), Tex = b.Tex });
-
-            // Fire flicker: the same surfaces, lit by the fire only, combined into one additive mesh.
-            var combined = new MeshBuilder(this, RoomTextures.White);
-            foreach (var b in new[] { floorB, wood, paper, plain, rug, brick }) combined.Append(b);
-            FireLight = combined.ToMesh(true);
-            Plugin.L.LogInfo($"Cozy room built: {Opaque.Count} parts, {combined.Count} vertices.");
+            // Lighting is ray traced on worker threads; the previous meshes stay visible until it finishes.
+            floorB.Alpha = 1f - Mathf.Clamp01(Plugin.Cfg.FloorReflection.Value);
+            StartBake(new[] { floorB, wood, logs, plain, rug, stone, plaid, deck, sky });
         }
 
-        // ---- lighting -----------------------------------------------------------------------------------
-
-        Color Ambient(Vector3 p, Vector3 n, bool shell)
+        /// <summary>A flat scenery layer outside the right window (facing the room), emissive.</summary>
+        void AddLayer(Texture tex, float x, float zc, float halfW, float y0, float y1)
         {
-            var c = new Color(0.016f, 0.013f, 0.013f) + new Color(0.005f, 0.004f, 0.003f) * (n.y * 0.5f + 0.5f);
-            foreach (var l in lights) c += PointContribution(l, p, n);
-            if (shell) c *= CornerOcclusion(p, n);
-            return c;
+            var b = new MeshBuilder(this, tex);
+            b.Quad(new Vector3(x, y0, zc - halfW), new Vector3(x, y0, zc + halfW), new Vector3(x, y1, zc + halfW), new Vector3(x, y1, zc - halfW),
+                   Vector3.left, Color.white, new Vector2(0, 0), new Vector2(1, 0), new Vector2(1, 1), new Vector2(0, 1), emissive: true);
+            Outside.Add(new Part { Mesh = b.ToMeshUnlit(), Tex = tex });
         }
 
-        Color PointContribution(PointLight l, Vector3 p, Vector3 n)
+        /// <summary>A small iron lantern with a glowing glass box.</summary>
+        /// <summary>Registers a candle flame (drawn animated each frame) and, optionally, its small warm light.</summary>
+        void AddCandle(Vector3 wickTop, float scale, float light)
         {
-            var to = l.Pos - p;
-            float dist = Mathf.Max(0.05f, to.magnitude);
-            var dir = to / dist;
-            float ndl = Mathf.Max(0f, Vector3.Dot(n, dir));
-            float att = 1f / (1f + (dist / l.Radius) * (dist / l.Radius));
-            float shape = 1f;
-            if (l.Lamp)
+            Candles.Add((wickTop, scale));
+            Glows.Add((wickTop + new Vector3(0, 0.025f * scale, 0), 0.11f * scale, new Color(0.20f, 0.12f, 0.045f) * scale, false));
+            if (light > 0f)
+                lights.Add(new PointLight { Pos = wickTop + new Vector3(0, 0.03f, 0), Col = new Color(1.0f, 0.62f, 0.30f) * light, Radius = 0.5f });
+        }
+
+        void Lantern(MeshBuilder b, Vector3 basePos, Color iron)
+        {
+            b.Box(basePos + new Vector3(0, 0.01f, 0), new Vector3(0.12f, 0.02f, 0.12f), iron);
+            b.Box(basePos + new Vector3(0, 0.1f, 0), new Vector3(0.09f, 0.15f, 0.09f), new Color(1f, 0.72f, 0.35f) * 0.85f, emissive: true);
+            lights.Add(new PointLight { Pos = basePos + new Vector3(0, 0.1f, 0), Col = new Color(1.0f, 0.62f, 0.30f) * 0.28f, Radius = 0.6f });
+            Glows.Add((basePos + new Vector3(0, 0.1f, 0), 0.2f, new Color(0.17f, 0.10f, 0.04f), false));
+            b.Box(basePos + new Vector3(0, 0.19f, 0), new Vector3(0.12f, 0.025f, 0.12f), iron);
+            b.Cylinder(basePos + new Vector3(0, 0.2f, 0), 0.05f, 0.01f, 0.06f, iron, 8);
+        }
+
+        /// <summary>
+        /// A skateboard standing on its tail, leaning back against the wall (towards -z), graphic facing the room.
+        /// tail = where the tail touches the floor.
+        /// </summary>
+        void BuildSkateboard(MeshBuilder plain, MeshBuilder deckB, Vector3 tail)
+        {
+            recordOcc = false; // parts are built at the origin and then moved; register one box instead
+            const float L = 0.80f, Wd = 0.21f, T = 0.014f;
+            var tilt = Quaternion.Euler(-15f, 0f, 0f);
+            var centre = tail + tilt * new Vector3(0, L / 2, 0) + new Vector3(0, 0.012f, 0);
+            var m = Matrix4x4.TRS(centre, tilt, Vector3.one);
+            // Deck (black grip/edges) and the graphic on the room side (+z local).
+            int s0 = plain.Count;
+            plain.Box(Vector3.zero, new Vector3(Wd, L, T), new Color(0.05f, 0.05f, 0.05f));
+            plain.Transform(s0, m);
+            int d0 = deckB.Count;
+            deckB.Quad(new Vector3(-Wd / 2, -L / 2, T / 2 + 0.0008f), new Vector3(-Wd / 2, L / 2, T / 2 + 0.0008f),
+                       new Vector3(Wd / 2, L / 2, T / 2 + 0.0008f), new Vector3(Wd / 2, -L / 2, T / 2 + 0.0008f),
+                       Vector3.forward, Color.white, new Vector2(0, 0), new Vector2(1, 0), new Vector2(1, 1), new Vector2(0, 1));
+            deckB.Transform(d0, m);
+            // Trucks and wheels on the wall side (-z local); wheels poke out at the sides.
+            foreach (var ty in new[] { -0.27f, 0.27f })
             {
-                // Dense shade open at top and bottom: strong pools straight up and down, little through the fabric.
-                float vertical = Mathf.Abs(dir.y);
-                shape = 0.08f + 1.4f * vertical * vertical * vertical;
+                int t0 = plain.Count;
+                plain.Box(new Vector3(0, ty, -T / 2 - 0.02f), new Vector3(0.16f, 0.04f, 0.04f), new Color(0.6f, 0.62f, 0.66f));
+                plain.Transform(t0, m);
+                foreach (var wx in new[] { -0.095f, 0.095f })
+                {
+                    int w0 = plain.Count;
+                    plain.Cylinder(new Vector3(0, -0.016f, 0), 0.027f, 0.027f, 0.032f, new Color(0.95f, 0.88f, 0.55f), 14);
+                    plain.Transform(w0, m * Matrix4x4.TRS(new Vector3(wx, ty, -T / 2 - 0.045f), Quaternion.Euler(0, 0, 90f), Vector3.one));
+                }
             }
-            return l.Col * (ndl * att * shape);
+            recordOcc = true;
+            AddOcc(centre, tilt * Vector3.right, tilt * Vector3.up, tilt * Vector3.forward, new Vector3(Wd / 2, L / 2, 0.04f));
         }
 
-        Color FireContribution(Vector3 p, Vector3 n)
+        // ---- baked lighting -----------------------------------------------------------------------------
+
+        readonly List<LightBaker.Obb> bakeOcc = new();
+        bool recordOcc = true;
+        System.Threading.Tasks.Task bakeTask;
+        LightBaker baker;
+        MeshBuilder[] pendingBuilders;
+        float bakeStarted;
+
+        static System.Numerics.Vector3 N3(Vector3 v) => new(v.x, v.y, v.z);
+
+        /// <summary>Registers a solid box (centre, axes, half extents) that casts shadows and occludes ambient light.</summary>
+        void AddOcc(Vector3 c, Vector3 x, Vector3 y, Vector3 z, Vector3 half)
         {
-            var c = PointContribution(fire, p, n);
-            // The surround and wall beside/above the opening are shadowed from the fire inside.
-            if (p.x < FireOpeningX - 0.01f && p.y > FireOpeningY0 + 0.62f) c *= 0.15f;
-            return c;
+            if (!recordOcc) return;
+            bakeOcc.Add(LightBaker.MakeObb(N3(c), N3(x), N3(y), N3(z), N3(half)));
         }
+        void AddOcc(Vector3 c, Vector3 size) => AddOcc(c, Vector3.right, Vector3.up, Vector3.forward, size / 2);
 
-        float CornerOcclusion(Vector3 p, Vector3 n)
+        void StartBake(MeshBuilder[] builders)
         {
-            float o = 1f;
-            o *= Occ(p.y - Floor, n.y > 0.5f);
-            o *= Occ(Ceil - p.y, n.y < -0.5f);
-            o *= Occ(p.x + RoomHalfW, n.x > 0.5f);
-            o *= Occ(RoomHalfW - p.x, n.x < -0.5f);
-            o *= Occ(p.z - ZBack, n.z > 0.5f);
-            o *= Occ(ZFront - p.z, n.z < -0.5f);
-            return o;
+            var b = new LightBaker
+            {
+                RoomHalfW = RoomHalfW, ZBack = ZBack, ZFront = ZFront, Floor = Floor, EaveH = EaveH, RidgeH = RidgeH,
+                WallInset = LogR * 0.6f,
+                FireOpeningX = FireOpeningX, FireZ0 = fireOpenZ0, FireZ1 = fireOpenZ1, FireY0 = FireOpeningY0, FireY1 = fireOpenY1,
+                FirePos = N3(fire.Pos),
+            };
+            b.Occluders.AddRange(bakeOcc);
+            foreach (var l in lights)
+            {
+                var bl = new LightBaker.Light { Col = new System.Numerics.Vector3(l.Col.r, l.Col.g, l.Col.b), Radius = l.Radius };
+                if (l.Window)
+                {
+                    bl.Kind = LightBaker.Kind.Window;
+                    var s = new List<System.Numerics.Vector3>();
+                    for (int j = 0; j < 3; j++)
+                        for (int i = 0; i < 4; i++)
+                            s.Add(N3(new Vector3(RoomHalfW + 0.14f, WindowCenter.y + (j - 1) * WindowH * 0.32f, WindowCenter.z + (i - 1.5f) * WindowW * 0.27f)));
+                    bl.Samples = s.ToArray();
+                }
+                else if (l.Samples != null) { bl.Kind = LightBaker.Kind.Chandelier; bl.Samples = System.Array.ConvertAll(l.Samples, N3); }
+                else if (l.Lamp)
+                {
+                    bl.Kind = LightBaker.Kind.Lamp;
+                    bl.Samples = new[] { N3(l.Pos), N3(l.Pos + new Vector3(0.05f, 0, 0)), N3(l.Pos + new Vector3(-0.05f, 0, 0)),
+                                         N3(l.Pos + new Vector3(0, 0, 0.05f)), N3(l.Pos + new Vector3(0, 0, -0.05f)), N3(l.Pos + new Vector3(0, 0.04f, 0)) };
+                }
+                else if (l.Fire)
+                {
+                    bl.Kind = LightBaker.Kind.Fire;
+                    var c = l.Pos;
+                    bl.Samples = new[] { N3(c), N3(c + new Vector3(0.06f, 0.08f, -0.22f)), N3(c + new Vector3(0.06f, 0.08f, 0.22f)),
+                                         N3(c + new Vector3(0.1f, -0.05f, -0.1f)), N3(c + new Vector3(0.1f, -0.05f, 0.1f)), N3(c + new Vector3(0, 0.2f, 0)) };
+                }
+                else
+                {
+                    bl.Kind = LightBaker.Kind.Point;
+                    bl.Samples = new[] { N3(l.Pos), N3(l.Pos + new Vector3(0, 0.015f, 0)) };
+                    bl.MaxRange = l.Radius * 6f;
+                }
+                b.Lights.Add(bl);
+            }
+
+            int total = 0;
+            foreach (var mb in builders) total += mb.Count;
+            b.P = new System.Numerics.Vector3[total]; b.N = new System.Numerics.Vector3[total]; b.Tint = new System.Numerics.Vector3[total];
+            b.Emissive = new bool[total]; b.NoAo = new bool[total];
+            int off = 0;
+            foreach (var mb in builders) { mb.Export(b, off); off += mb.Count; }
+
+            baker = b;
+            pendingBuilders = builders;
+            bakeStarted = Time.realtimeSinceStartup;
+            bakeTask = b.BakeAsync();
+            Plugin.L.LogInfo($"Lodge geometry ready: {total} vertices, {bakeOcc.Count} occluders, {b.Lights.Count} lights; baking lighting...");
         }
 
-        static float Occ(float dist, bool onThisPlane) => onThisPlane ? 1f : 1f - 0.35f * Mathf.Exp(-Mathf.Max(0, dist) / 0.25f);
+        /// <summary>Call every frame: swaps in the lit meshes once the bake has finished. True when swapped.</summary>
+        public bool TryFinish()
+        {
+            if (bakeTask == null || !bakeTask.IsCompleted) return false;
+            var task = bakeTask; bakeTask = null;
+            if (task.IsFaulted) { Plugin.L.LogError("Light bake failed: " + task.Exception); return false; }
+
+            foreach (var p in Opaque) Object.Destroy(p.Mesh);
+            Opaque.Clear();
+            if (FireLight != null) Object.Destroy(FireLight);
+
+            int off = 0;
+            foreach (var mb in pendingBuilders)
+            {
+                if (mb.Count > 0) Opaque.Add(new Part { Mesh = mb.ToMesh(baker.Base, off), Tex = mb.Tex });
+                off += mb.Count;
+            }
+            // Fire flicker: every lit surface (the sky is last and excluded), fire contribution only.
+            var combined = new MeshBuilder(this, RoomTextures.White);
+            for (int i = 0; i < pendingBuilders.Length - 1; i++) combined.Append(pendingBuilders[i]);
+            FireLight = combined.ToMesh(baker.FireOnly, 0);
+            Plugin.L.LogInfo($"Lodge lighting baked in {Time.realtimeSinceStartup - bakeStarted:0.00} s ({combined.Count} lit vertices).");
+            pendingBuilders = null; baker = null;
+            return true;
+        }
 
         // ---- mesh building ------------------------------------------------------------------------------
 
@@ -403,16 +668,18 @@ namespace OlliVR
 
             /// <summary>A finely tessellated plane (so the per-vertex lighting is smooth), optionally with a hole.</summary>
             public void Grid(Vector3 origin, Vector3 uDir, Vector3 vDir, float uLen, float vLen, Vector3 n, Color col,
-                             Vector2? uvScale = null, bool swapUV = false, bool shell = false, Rect? hole = null)
+                             Vector2? uvScale = null, bool swapUV = false, bool shell = false, Rect? hole = null,
+                             System.Func<Vector3, Vector3> warp = null, float step = 0.1f)
             {
                 var sc = uvScale ?? Vector2.one;
-                var us = Breaks(uLen, hole?.xMin, hole?.xMax);
-                var vs = Breaks(vLen, hole?.yMin, hole?.yMax);
+                var us = Breaks(uLen, hole?.xMin, hole?.xMax, step);
+                var vs = Breaks(vLen, hole?.yMin, hole?.yMax, step);
                 var idx = new int[us.Count, vs.Count];
                 for (int j = 0; j < vs.Count; j++)
                     for (int i = 0; i < us.Count; i++)
                     {
                         var p = origin + uDir * us[i] + vDir * vs[j];
+                        if (warp != null) p = warp(p);
                         var t = swapUV ? new Vector2(vs[j] * sc.x, us[i] * sc.y) : new Vector2(us[i] * sc.x, vs[j] * sc.y);
                         idx[i, j] = V(p, n, t, col, false, shell);
                     }
@@ -430,9 +697,9 @@ namespace OlliVR
                     }
             }
 
-            static List<float> Breaks(float len, float? h0, float? h1)
+            static List<float> Breaks(float len, float? h0, float? h1, float step)
             {
-                const float Step = 0.15f;
+                float Step = step;
                 // Fixed lines (ends and hole edges) are always kept; regular steps too close to them are dropped.
                 var fixedLines = new List<float> { 0f, len };
                 if (h0.HasValue) { fixedLines.Add(h0.Value); fixedLines.Add(h1.Value); }
@@ -447,14 +714,153 @@ namespace OlliVR
                 return l;
             }
 
-            public void Box(Vector3 c, Vector3 size, Color col, bool emissive = false, BoxFaces onlyFaces = BoxFaces.All)
+            /// <summary>
+            /// A box. Full boxes get chamfered edges (bevel, default ~1.5 cm) so edges catch the light instead of
+            /// meeting at a hard 90 degrees; pass a larger bevel for soft, rounded shapes like cushions.
+            /// </summary>
+            public void Box(Vector3 c, Vector3 size, Color col, bool emissive = false, BoxFaces onlyFaces = BoxFaces.All, float bevel = -1f)
+            {
+                float minDim = Mathf.Min(size.x, Mathf.Min(size.y, size.z));
+                float b = bevel >= 0f ? bevel : Mathf.Min(0.015f, minDim * 0.2f);
+                b = Mathf.Min(b, minDim * 0.45f);
+                if (onlyFaces == BoxFaces.All && !emissive && minDim >= 0.008f) room.AddOcc(c, size);
+                if (onlyFaces == BoxFaces.All && b > 0.002f) { BevelBox(c, size, col, emissive, b); return; }
+                SharpBox(c, size, col, emissive, onlyFaces);
+            }
+
+            void BevelBox(Vector3 c, Vector3 size, Color col, bool emissive, float b)
+            {
+                var h = size / 2;
+                const float uvs = 0.6f;
+                Vector3 Axis(int a) => a == 0 ? Vector3.right : a == 1 ? Vector3.up : Vector3.forward;
+                float Hc(int a) => a == 0 ? h.x : a == 1 ? h.y : h.z;
+                // Faces, inset by the bevel.
+                for (int a = 0; a < 3; a++)
+                    for (int s = -1; s <= 1; s += 2)
+                    {
+                        int a1 = (a + 1) % 3, a2 = (a + 2) % 3;
+                        var n = Axis(a) * s;
+                        var o = c + n * Hc(a);
+                        var e1 = Axis(a1) * (Hc(a1) - b);
+                        var e2 = Axis(a2) * (Hc(a2) - b);
+                        float uw = 2 * (Hc(a1) - b), vh = 2 * (Hc(a2) - b);
+                        int sub = Mathf.Clamp(Mathf.CeilToInt(Mathf.Max(uw, vh) / 0.12f), 1, 40);
+                        // Consistent winding doesn't matter (no culling); UVs in metres / uvs.
+                        Quad(o - e1 - e2, o + e1 - e2, o + e1 + e2, o - e1 + e2, n, col,
+                             new Vector2(0, 0), new Vector2(uw / uvs, 0), new Vector2(uw / uvs, vh / uvs), new Vector2(0, vh / uvs), emissive, sub);
+                    }
+                // Edge strips between two faces, along the third axis.
+                for (int a3 = 0; a3 < 3; a3++)
+                {
+                    int a1 = (a3 + 1) % 3, a2 = (a3 + 2) % 3;
+                    for (int s1 = -1; s1 <= 1; s1 += 2)
+                        for (int s2 = -1; s2 <= 1; s2 += 2)
+                        {
+                            var n = (Axis(a1) * s1 + Axis(a2) * s2).normalized;
+                            var p1 = c + Axis(a1) * (s1 * Hc(a1)) + Axis(a2) * (s2 * (Hc(a2) - b));
+                            var p2 = c + Axis(a1) * (s1 * (Hc(a1) - b)) + Axis(a2) * (s2 * Hc(a2));
+                            var e = Axis(a3) * (Hc(a3) - b);
+                            float len = 2 * (Hc(a3) - b);
+                            int sub = Mathf.Clamp(Mathf.CeilToInt(len / 0.12f), 1, 40);
+                            Quad(p1 - e, p1 + e, p2 + e, p2 - e, n, col,
+                                 new Vector2(0, 0), new Vector2(len / uvs, 0), new Vector2(len / uvs, b / uvs), new Vector2(0, b / uvs), emissive, sub);
+                        }
+                }
+                // Corner triangles.
+                for (int sx = -1; sx <= 1; sx += 2)
+                    for (int sy = -1; sy <= 1; sy += 2)
+                        for (int sz = -1; sz <= 1; sz += 2)
+                        {
+                            var n = new Vector3(sx, sy, sz).normalized;
+                            int i0 = V(c + new Vector3(sx * h.x, sy * (h.y - b), sz * (h.z - b)), n, Vector2.zero, col, emissive, false);
+                            int i1 = V(c + new Vector3(sx * (h.x - b), sy * h.y, sz * (h.z - b)), n, Vector2.zero, col, emissive, false);
+                            int i2 = V(c + new Vector3(sx * (h.x - b), sy * (h.y - b), sz * h.z), n, Vector2.zero, col, emissive, false);
+                            tris.Add(i0); tris.Add(i1); tris.Add(i2);
+                        }
+            }
+
+            /// <summary>
+            /// A stone surface displaced by the river-stone height map, so the stones physically stand out and the
+            /// per-vertex lighting shades their sides. Rectangle given by two opposite corners on a vertical plane
+            /// with normal n (x or z facing), optionally with a rectangular hole (in u = z or x, and y).
+            /// The grid lines sit on a world-aligned lattice and the displacement fades to zero at every edge, so
+            /// faces that meet (corners, the opening) join flush without seams.
+            /// </summary>
+            public void StoneFace(Vector3 c0, Vector3 c1, Vector3 n, Color col, float uvSize, float depth = 0.045f, Rect? hole = null)
+            {
+                bool xFacing = Mathf.Abs(n.x) > 0.5f;
+                float u0 = xFacing ? Mathf.Min(c0.z, c1.z) : Mathf.Min(c0.x, c1.x);
+                float u1 = xFacing ? Mathf.Max(c0.z, c1.z) : Mathf.Max(c0.x, c1.x);
+                float y0 = Mathf.Min(c0.y, c1.y), y1 = Mathf.Max(c0.y, c1.y);
+                float plane = xFacing ? c0.x : c0.z;
+                const float Step = 0.025f, Fade = 0.05f;
+                var us = Lattice(u0, u1, Step, hole.HasValue ? new[] { hole.Value.xMin, hole.Value.xMax } : null);
+                var vs = Lattice(y0, y1, Step, hole.HasValue ? new[] { hole.Value.yMin, hole.Value.yMax } : null);
+                int nu = us.Count - 1, nv = vs.Count - 1;
+                var P = new Vector3[nu + 1, nv + 1];
+                var T = new Vector2[nu + 1, nv + 1];
+                for (int j = 0; j <= nv; j++)
+                    for (int i = 0; i <= nu; i++)
+                    {
+                        float u = us[i], y = vs[j];
+                        var t = new Vector2(u, y) / uvSize;
+                        float edge = Mathf.Min(Mathf.Min(u - u0, u1 - u), Mathf.Min(y - y0, y1 - y));
+                        if (hole.HasValue)
+                        {
+                            var hr = hole.Value;
+                            float dx = Mathf.Max(hr.xMin - u, 0f, u - hr.xMax), dy = Mathf.Max(hr.yMin - y, 0f, y - hr.yMax);
+                            edge = Mathf.Min(edge, Mathf.Sqrt(dx * dx + dy * dy));
+                        }
+                        float fade = Mathf.SmoothStep(0f, 1f, Mathf.Clamp01(edge / Fade));
+                        float hgt = RoomTextures.SampleStone(t.x, t.y) * fade;
+                        var p = xFacing ? new Vector3(plane, y, u) : new Vector3(u, y, plane);
+                        P[i, j] = p + n * (hgt * depth);
+                        T[i, j] = t;
+                    }
+                int baseIdx = pos.Count;
+                for (int j = 0; j <= nv; j++)
+                    for (int i = 0; i <= nu; i++)
+                    {
+                        var du = P[Mathf.Min(nu, i + 1), j] - P[Mathf.Max(0, i - 1), j];
+                        var dv = P[i, Mathf.Min(nv, j + 1)] - P[i, Mathf.Max(0, j - 1)];
+                        var nn = Vector3.Cross(du, dv).normalized;
+                        if (Vector3.Dot(nn, n) < 0) nn = -nn;
+                        V(P[i, j], nn, T[i, j], col, false, false);
+                    }
+                for (int j = 0; j < nv; j++)
+                    for (int i = 0; i < nu; i++)
+                    {
+                        if (hole.HasValue && hole.Value.Contains(new Vector2((us[i] + us[i + 1]) / 2, (vs[j] + vs[j + 1]) / 2))) continue;
+                        int i0 = baseIdx + j * (nu + 1) + i, i1 = i0 + nu + 1;
+                        tris.Add(i0); tris.Add(i1); tris.Add(i1 + 1);
+                        tris.Add(i0); tris.Add(i1 + 1); tris.Add(i0 + 1);
+                    }
+            }
+
+            /// <summary>Grid lines at world multiples of step between a and b, plus a, b and any extra lines.</summary>
+            static List<float> Lattice(float a, float b, float step, float[] extra)
+            {
+                var fixedLines = new List<float> { a, b };
+                if (extra != null) foreach (var e in extra) if (e > a && e < b) fixedLines.Add(e);
+                var l = new List<float>(fixedLines);
+                for (float x = Mathf.Ceil(a / step) * step; x < b; x += step)
+                {
+                    bool near = false;
+                    foreach (var f in fixedLines) if (Mathf.Abs(f - x) < step * 0.3f) { near = true; break; }
+                    if (!near) l.Add(x);
+                }
+                l.Sort();
+                return l;
+            }
+
+            void SharpBox(Vector3 c, Vector3 size, Color col, bool emissive, BoxFaces onlyFaces)
             {
                 var h = size / 2;
                 float uvs = 0.6f;
                 void F(BoxFaces f, Vector3 n, Vector3 a, Vector3 b, Vector3 cc, Vector3 d, float uw, float vh)
                 {
                     if ((onlyFaces & f) == 0) return;
-                    int sub = Mathf.Clamp(Mathf.CeilToInt(Mathf.Max(uw, vh) / 0.3f), 1, 20);
+                    int sub = Mathf.Clamp(Mathf.CeilToInt(Mathf.Max(uw, vh) / 0.12f), 1, 40);
                     Quad(a, b, cc, d, n, col, new Vector2(0, 0), new Vector2(uw / uvs, 0), new Vector2(uw / uvs, vh / uvs), new Vector2(0, vh / uvs), emissive, sub);
                 }
                 var p = c;
@@ -526,6 +932,58 @@ namespace OlliVR
                 Tri(u0, uc, tip); Tri(uc, u1, tip);
             }
 
+            /// <summary>Applies a transform to every vertex added since index 'from' (positions and normals).</summary>
+            public void Transform(int from, Matrix4x4 m)
+            {
+                for (int i = from; i < pos.Count; i++)
+                {
+                    pos[i] = m.MultiplyPoint3x4(pos[i]);
+                    nrm[i] = m.MultiplyVector(nrm[i]).normalized;
+                }
+            }
+
+            /// <summary>A box rotated about its centre.</summary>
+            public void BoxRotated(Vector3 c, Vector3 size, Quaternion rot, Color col, bool emissive = false)
+            {
+                int from = pos.Count;
+                bool rec = room.recordOcc; room.recordOcc = false;
+                Box(Vector3.zero, size, col, emissive);
+                room.recordOcc = rec;
+                if (!emissive) room.AddOcc(c, rot * Vector3.right, rot * Vector3.up, rot * Vector3.forward, size / 2);
+                Transform(from, Matrix4x4.TRS(c, rot, Vector3.one));
+            }
+
+            /// <summary>
+            /// Half a log from a to b, bulging towards 'inward' (the other half is inside the wall). Tessellated
+            /// along its length so the baked lighting stays smooth.
+            /// </summary>
+            public void LogRun(Vector3 a, Vector3 b, Vector3 inward, float r, Color col)
+            {
+                var axis = b - a;
+                float len = axis.magnitude;
+                if (len < 0.05f) return;
+                const int Around = 10;
+                int along = Mathf.Clamp(Mathf.CeilToInt(len / 0.12f), 1, 80);
+                int baseIdx = pos.Count;
+                for (int j = 0; j <= along; j++)
+                {
+                    float t = j / (float)along;
+                    for (int i = 0; i <= Around; i++)
+                    {
+                        float th = Mathf.Lerp(-90f, 90f, i / (float)Around) * Mathf.Deg2Rad;
+                        var n = inward * Mathf.Cos(th) + Vector3.up * Mathf.Sin(th);
+                        V(a + axis * t + n * r, n, new Vector2(t * len / 1.6f, i / (float)Around), col, false, true);
+                    }
+                }
+                for (int j = 0; j < along; j++)
+                    for (int i = 0; i < Around; i++)
+                    {
+                        int i0 = baseIdx + j * (Around + 1) + i, i1 = i0 + Around + 1;
+                        tris.Add(i0); tris.Add(i1); tris.Add(i1 + 1);
+                        tris.Add(i0); tris.Add(i1 + 1); tris.Add(i0 + 1);
+                    }
+            }
+
             /// <summary>A log lying along z.</summary>
             public void LogZ(Vector3 center, float r, float len, Color col)
             {
@@ -569,19 +1027,48 @@ namespace OlliVR
                     }
             }
 
-            public Mesh ToMesh(bool fireOnly)
+            /// <summary>Opacity written into the vertex colours (the floor is partly see-through to its reflection).</summary>
+            public float Alpha = 1f;
+
+            /// <summary>Copies this builder's vertices into the baker's arrays at the given offset.</summary>
+            public void Export(LightBaker b, int off)
+            {
+                for (int i = 0; i < pos.Count; i++)
+                {
+                    b.P[off + i] = N3(pos[i]);
+                    b.N[off + i] = N3(nrm[i]);
+                    b.Tint[off + i] = new System.Numerics.Vector3(tint[i].r, tint[i].g, tint[i].b);
+                    b.Emissive[off + i] = emissive[i];
+                    b.NoAo[off + i] = false;
+                }
+            }
+
+            /// <summary>Mesh with the baked colours colours[off + i].</summary>
+            public Mesh ToMesh(System.Numerics.Vector3[] colours, int off)
             {
                 int n = pos.Count;
-                var v = new Vector3[n]; var t = new Vector2[n]; var c = new Color[n];
+                var c = new Color[n];
                 for (int i = 0; i < n; i++)
                 {
-                    v[i] = pos[i]; t[i] = uv[i];
-                    if (fireOnly)
-                        c[i] = emissive[i] ? Color.black : Mul(tint[i], room.FireContribution(pos[i], nrm[i]));
-                    else
-                        c[i] = emissive[i] ? tint[i] : Mul(tint[i], room.Ambient(pos[i], nrm[i], shell[i]));
-                    c[i].a = 1f;
+                    var k = colours[off + i];
+                    c[i] = new Color(Mathf.Clamp01(k.X), Mathf.Clamp01(k.Y), Mathf.Clamp01(k.Z), Alpha);
                 }
+                return Build(c);
+            }
+
+            /// <summary>Mesh coloured by its tint only (emissive scenery).</summary>
+            public Mesh ToMeshUnlit()
+            {
+                var c = new Color[pos.Count];
+                for (int i = 0; i < c.Length; i++) { c[i] = tint[i]; c[i].a = Alpha; }
+                return Build(c);
+            }
+
+            Mesh Build(Color[] c)
+            {
+                int n = pos.Count;
+                var v = new Vector3[n]; var t = new Vector2[n];
+                for (int i = 0; i < n; i++) { v[i] = pos[i]; t[i] = uv[i]; }
                 var m = new Mesh { name = "OlliVR_Room", hideFlags = HideFlags.HideAndDontSave };
                 if (n > 65000) m.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
                 m.vertices = v; m.uv = t; m.colors = c;
@@ -591,8 +1078,6 @@ namespace OlliVR
                 Object.DontDestroyOnLoad(m);
                 return m;
             }
-
-            static Color Mul(Color a, Color b) => new(Mathf.Clamp01(a.r * b.r), Mathf.Clamp01(a.g * b.g), Mathf.Clamp01(a.b * b.b), 1f);
         }
     }
 }

@@ -56,8 +56,8 @@ namespace OlliVR
 
             AmbientGlow = f.Bind("Environment", "AmbientGlow", 1.0f,
                 "Brightness of the light the screen's edge colours cast on the wall and floor around it. 0 = dark room.");
-            FloorReflection = f.Bind("Environment", "FloorReflection", 0.12f,
-                "Strength of the screen's reflection in the floor (0 to 1). 0 = off.");
+            FloorReflection = f.Bind("Environment", "FloorReflection", 0.2f,
+                "How glossy the varnished floor is: strength of the room's (and the TV's) reflection in it, 0 to 1. 0 = matte.");
 
             FlipVertical = f.Bind("Rendering", "FlipVertical", true,
                 "Flip images vertically on submit. Toggle if the screen is upside down.");
