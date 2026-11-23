@@ -24,12 +24,21 @@ A BepInEx 6 (IL2CPP) mod that puts **OlliOlli World** on a big stereoscopic 3D v
 - [BepInEx 6 Bleeding Edge](https://builds.bepinex.dev/projects/bepinex_be), the **IL2CPP win-x64** build. Tested with build **6.0.0-be.793**.
 
 ## Installation
+
+### Quick install (BepInEx included)
+1. Download `OlliVR-vX.Y.Z-with-BepInEx.zip` from [Releases](../../releases).
+2. Extract it into the game folder, for example `C:\Program Files (x86)\Steam\steamapps\common\OlliOlli World`, so that `winhttp.dll` and the `BepInEx` folder sit next to `OlliOlli World.exe`.
+3. Start SteamVR, put on your headset, then launch OlliOlli World from Steam. The first launch takes a minute or two longer while BepInEx sets itself up.
+
+This zip contains an unmodified BepInEx 6.0.0-be.793 (LGPL-2.1). If you already have BepInEx installed, use the manual install below instead, so your setup isn't overwritten.
+
+### Manual install
 1. **Install BepInEx.**
    - Download `BepInEx-Unity.IL2CPP-win-x64-6.0.0-be.793` (or newer) from the [BepInEx bleeding edge builds](https://builds.bepinex.dev/projects/bepinex_be).
    - Extract it into the game folder, for example `C:\Program Files (x86)\Steam\steamapps\common\OlliOlli World`, so that `winhttp.dll` and the `BepInEx` folder sit next to `OlliOlli World.exe`.
 2. **Run the game once without the mod.** BepInEx generates its interop assemblies on first launch. This takes a minute or two. Quit once you reach the title screen.
 3. **Install OlliVR.** Pick one:
-   - **Prebuilt:** download the latest zip from [Releases](../../releases) and extract it into the game folder. You should end up with `BepInEx\plugins\OlliVR\OlliVR.dll` and `openvr_api.dll`.
+   - **Prebuilt:** download `OlliVR-vX.Y.Z.zip` (without BepInEx) from [Releases](../../releases) and extract it into the game folder. You should end up with `BepInEx\plugins\OlliVR\OlliVR.dll` and `openvr_api.dll`.
    - **From source:** install the [.NET SDK](https://dotnet.microsoft.com/download) (6.0 or newer), clone this repo and build it:
      ```powershell
      dotnet build -c Release -p:GameDir="C:\Program Files (x86)\Steam\steamapps\common\OlliOlli World"
