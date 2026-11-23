@@ -5,15 +5,12 @@
 A BepInEx 6 (IL2CPP) mod that puts **OlliOlli World** on a big stereoscopic 3D virtual screen in SteamVR. It works with the Steam Frame, Valve Index, Quest via Link or Virtual Desktop, and any other SteamVR headset. The game keeps its familiar side-on view, but now it has real depth. With **head-coupled perspective** ("fish tank VR") the screen acts like a window into the game world: lean or move your head and the view through it shifts. Play with a gamepad.
 
 ## Features
-- **True stereo 3D.** The game's 3D world is rendered once per eye, so foreground rails pop out of the screen and backgrounds recede behind it.
-- **Fish tank VR.** Each eye looks through the screen with an off-axis projection that follows your real head position. The screen behaves like a window, not a flat picture.
-- **Faithful framing.** The screen matches the game camera's exact field of view and its off-centre framing (the skater on the left, room to see what's ahead). From the normal viewing position it looks like the flat game, plus depth.
-- **Steady, comfortable depth.** Convergence follows your skater, so the thing you watch sits on the screen surface and the depth doesn't jump as scenery passes.
-- **All the UI, intact.** Menus, the world map with its cursor, level cards and checkmarks, the HUD, speech bubbles and the title logo effects all appear on the screen.
-- **Comfortable screen.** A large virtual screen 2 m in front of you, with adjustable size, distance and height. It recenters automatically when you put the headset on, or on demand.
-- **VR-friendly post-processing.** TAA is replaced with FXAA and motion blur is turned off, because both misbehave when rendering two eyes.
-- **Your monitor keeps working.** The desktop window still shows the game.
-- **Configurable.** Depth strength, fish-tank strength, convergence and more, all in a BepInEx config file.
+- **Real 3D depth.** Rails, ramps and scenery pop out of the screen or sit behind it, so you can judge gaps and landings by depth.
+- **Look into the world.** Lean or move your head and the view shifts, as if the screen were a window into the game.
+- **Plays like the original.** Same side-on view, same framing with room to see what's coming, same controls on your gamepad.
+- **Steady depth.** Your skater always sits on the screen surface, so the 3D stays comfortable at speed.
+- **The whole game works.** Menus, the world map, the HUD and dialogue all show up in VR.
+- **A big screen in front of you.** Recenter any time with L3 + R3. Size, distance and depth strength are adjustable.
 
 <p align="center"><img src="docs/side-by-side.jpg" alt="Side-by-side stereo image as sent to the headset"><br><sub>The side-by-side image the headset receives (left eye, right eye).</sub></p>
 
