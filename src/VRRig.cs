@@ -632,6 +632,7 @@ namespace OlliVR
                 var dir = BepInEx.Paths.BepInExRootPath;
                 SaveRT(screen.StereoTexture, System.IO.Path.Combine(dir, "OlliVR_capture_Stereo.png"));
                 SaveRT(ambience.Left, System.IO.Path.Combine(dir, "OlliVR_capture_Room.png"));
+                ambience.CaptureViews(dir, SaveRT, screen.StereoTexture);
                 {
                     var prev = RenderTexture.active;
                     RenderTexture.active = screen.StereoTexture;
