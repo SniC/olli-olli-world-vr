@@ -132,8 +132,9 @@ namespace OlliVR
             texTask = System.Threading.Tasks.Task.Run(RoomTextures.Generate);
 
 
-            projL = VRSession.GetEyeProjection(EVREye.Eye_Left, 0.05f, 100f);
-            projR = VRSession.GetEyeProjection(EVREye.Eye_Right, 0.05f, 100f);
+            // Far plane out past the sky dome (the view through the window reaches kilometres).
+            projL = VRSession.GetEyeProjection(EVREye.Eye_Left, 0.05f, 3000f);
+            projR = VRSession.GetEyeProjection(EVREye.Eye_Right, 0.05f, 3000f);
             VRSession.GetEyeToHead(EVREye.Eye_Left, out eyePosL, out eyeRotL);
             VRSession.GetEyeToHead(EVREye.Eye_Right, out eyePosR, out eyeRotR);
             seatedHeight = VRSession.SeatedHeightAboveFloor();
@@ -296,6 +297,8 @@ namespace OlliVR
             snowOffset2 = Mathf.Repeat(snowOffset2 + dt * 0.06f, 1f);
 
             UpdateSparks(dt);
+            var headLocal = Quaternion.Inverse(originRot) * hmdRot;
+            UpdateSnowfall(dt, headLocal * Vector3.right, headLocal * Vector3.up);
             lastScreenImg = screen.StereoTexture;
             RenderEye(msaaL, reflL, hmdPos + hmdRot * eyePosL, hmdRot * eyeRotL, projL, roomM, originRot, floorY, glow, reflection, screen.StereoTexture, 0f, 0.5f);
             msaaL.ResolveAntiAliasedSurface(Left);
@@ -314,7 +317,7 @@ namespace OlliVR
             var rt = MakeRT("OlliVR_RoomCapture", 1600, 1000, false, 24);
             var reflCap = MakeRT("OlliVR_RoomCaptureRefl", 800, 500, true, 24);
             reflCap.mipMapBias = 1.0f;
-            var proj = Matrix4x4.Perspective(90f, 1.6f, 0.05f, 100f);
+            var proj = Matrix4x4.Perspective(90f, 1.6f, 0.05f, 3000f);
             var roomM = Matrix4x4.TRS(lastOriginPos, lastOriginRot, Vector3.one);
             foreach (var (name, yaw) in new[] { ("Left", -75f), ("Ahead", 0f), ("Right", 75f), ("Behind", 180f) })
             {
@@ -323,14 +326,14 @@ namespace OlliVR
                 DrawScreenForCapture(rt, lastOriginPos, rot, proj, roomM, screenImage);
                 save(rt, System.IO.Path.Combine(dir, $"OlliVR_capture_Room{name}.png"));
             }
-            // Close-up of the floor lamp (debug).
+            // Close-ups (debug): the floor lamp and the window.
+            foreach (var (name, target, offset) in new[] { ("Lamp", room.LampPos, new Vector3(-0.75f, 0.1f, -0.75f)), ("Window", room.WindowCenter, new Vector3(-1.3f, -0.05f, -0.2f)) })
             {
-                var target = room.LampPos;
-                var eyeL = target + new Vector3(-0.75f, 0.1f, -0.75f);
+                var eyeL = target + offset;
                 var rotL = Quaternion.LookRotation(target - eyeL, Vector3.up);
                 var eyeW = roomM.MultiplyPoint3x4(eyeL);
                 RenderEye(rt, reflCap, eyeW, lastOriginRot * rotL, proj, roomM, lastOriginRot, lastFloorY, lastGlow, lastReflection, lastScreenImg, 0f, 0.5f);
-                save(rt, System.IO.Path.Combine(dir, "OlliVR_capture_RoomLamp.png"));
+                save(rt, System.IO.Path.Combine(dir, $"OlliVR_capture_Room{name}.png"));
             }
             rt.Release();
             reflCap.Release();
@@ -440,6 +443,16 @@ namespace OlliVR
                 texMatZ.SetPass(0);
                 Graphics.DrawMeshNow(part.Mesh, model);
             }
+            // The 3D view outside (terrain, trees, mountains, sky): opaque with depth, seen through the window.
+            for (int i = 0; i < room.OutsideOpaque.Count; i++)
+            {
+                var part = room.OutsideOpaque[i];
+                depthMat.SetPass(0);
+                Graphics.DrawMeshNow(part.Mesh, model);
+                texMatZ.mainTexture = part.Tex;
+                texMatZ.SetPass(0);
+                Graphics.DrawMeshNow(part.Mesh, model);
+            }
             // The TV around the screen (not baked: it follows the screen size).
             if (room.TvPart.HasValue)
             {
@@ -500,7 +513,7 @@ namespace OlliVR
             GL.modelview = view * model;
             DrawFlames();
             DrawCandleFlames(eyeLocal);
-            DrawSnow();
+            DrawSnowfall(view, model);
             if (screenImg != null) DrawScreenQuad(screenImg, su0, su1);
             if (main)
             {
@@ -695,6 +708,84 @@ namespace OlliVR
                 GL.TexCoord2(u1, 0); GL.Vertex3(x, basePos.y, zc + w / 2);
             }
             GL.End();
+        }
+
+        // ---- snowfall outside the window ----------------------------------------------------------------
+
+        struct Flake { public System.Numerics.Vector3 P; public float Speed, Phase, Size, Bright; }
+        Flake[] flakes;
+        Mesh snowBatch;
+        Vector3[] snowV;
+        Color[] snowC;
+        const int FlakeCount = 900;
+
+        void SpawnFlake(ref Flake f, bool anywhere)
+        {
+            var wc = room.WindowCenter;
+            float x = wc.x + 0.4f + (float)System.Math.Pow(fxRng.NextDouble(), 1.4) * 16f;
+            float spread = 2f + (x - wc.x) * 0.9f;   // the view widens with distance
+            f.P = new System.Numerics.Vector3(x, anywhere ? Rnd(room.Floor - 2f, room.Floor + 6f) : room.Floor + 6f + Rnd(0f, 1f),
+                                              wc.z + Rnd(-spread, spread));
+            f.Speed = Rnd(0.45f, 1.1f);
+            f.Phase = Rnd(0f, 6.28f);
+            f.Size = Rnd(0.018f, 0.042f) * (1f + (x - wc.x) * 0.06f);   // far flakes a bit larger so they stay visible
+            f.Bright = Rnd(0.55f, 1f);
+        }
+
+        void UpdateSnowfall(float dt, Vector3 rightU, Vector3 upU)
+        {
+            if (room.WindowW <= 0f) return;
+            int n = FlakeCount;
+            if (flakes == null)
+            {
+                flakes = new Flake[n];
+                for (int i = 0; i < n; i++) SpawnFlake(ref flakes[i], true);
+                snowBatch = new Mesh { name = "OlliVR_Snow", hideFlags = HideFlags.HideAndDontSave };
+                snowBatch.MarkDynamic();
+                Object.DontDestroyOnLoad(snowBatch);
+                snowV = new Vector3[n * 4];
+                var col = new Color[n * 4];
+                var uv = new Vector2[n * 4];
+                var tri = new int[n * 6];
+                for (int i = 0; i < n; i++)
+                {
+                    // Brightness is per slot (set once), so colours never need re-uploading.
+                    var c = new Color(0.80f, 0.85f, 0.95f) * flakes[i].Bright; c.a = 1f;
+                    col[i * 4] = c; col[i * 4 + 1] = c; col[i * 4 + 2] = c; col[i * 4 + 3] = c;
+                    uv[i * 4] = new Vector2(0, 0); uv[i * 4 + 1] = new Vector2(0, 1); uv[i * 4 + 2] = new Vector2(1, 1); uv[i * 4 + 3] = new Vector2(1, 0);
+                    tri[i * 6] = i * 4; tri[i * 6 + 1] = i * 4 + 1; tri[i * 6 + 2] = i * 4 + 2;
+                    tri[i * 6 + 3] = i * 4; tri[i * 6 + 4] = i * 4 + 2; tri[i * 6 + 5] = i * 4 + 3;
+                }
+                snowBatch.vertices = snowV; snowBatch.uv = uv; snowBatch.colors = col; snowBatch.triangles = tri;
+                snowBatch.bounds = new Bounds(Vector3.zero, Vector3.one * 1000f);
+            }
+            float t = Time.unscaledTime;
+            // One set of camera-facing quads per frame (oriented to the head), shared by both eyes.
+            var right = N3(rightU); var up = N3(upU);
+            for (int i = 0; i < n; i++)
+            {
+                ref var f = ref flakes[i];
+                f.P.Y -= f.Speed * dt;
+                f.P.Z += System.MathF.Sin(t * 0.9f + f.Phase) * 0.25f * dt + 0.08f * dt;   // drift and a light breeze
+                f.P.X += System.MathF.Cos(t * 0.7f + f.Phase * 1.3f) * 0.12f * dt;
+                if (f.P.Y < room.Floor - 2.5f) { float b = f.Bright; SpawnFlake(ref f, false); f.Bright = b; }
+                var r = right * f.Size; var u = up * f.Size;
+                var a0 = f.P - r - u; var a1 = f.P - r + u; var a2 = f.P + r + u; var a3 = f.P + r - u;
+                snowV[i * 4] = new Vector3(a0.X, a0.Y, a0.Z); snowV[i * 4 + 1] = new Vector3(a1.X, a1.Y, a1.Z);
+                snowV[i * 4 + 2] = new Vector3(a2.X, a2.Y, a2.Z); snowV[i * 4 + 3] = new Vector3(a3.X, a3.Y, a3.Z);
+            }
+            snowBatch.vertices = snowV;
+        }
+
+        /// <summary>Snowflakes falling outside: soft dots in one batched mesh (built once per frame).</summary>
+        void DrawSnowfall(Matrix4x4 view, Matrix4x4 model)
+        {
+            if (snowBatch == null) return;
+            var m = glowAdditive ? glowMat : addMat;
+            m.mainTexture = RoomTextures.Halo;
+            m.SetPass(m == glowMat ? glowPass : 0);
+            GL.modelview = view;
+            Graphics.DrawMeshNow(snowBatch, model);
         }
 
         void DrawSnow()

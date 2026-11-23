@@ -14,7 +14,7 @@ namespace OlliVR
     /// The fire's flicker is a separate additive mesh whose brightness animates per frame. The view outside is a
     /// stack of layers at different distances (sky, mountains, forest, near pines) for real parallax.
     /// </summary>
-    internal class CozyRoom
+    internal partial class CozyRoom
     {
         public struct Part { public Mesh Mesh; public Texture Tex; }
 
@@ -612,14 +612,8 @@ namespace OlliVR
                 for (int k = 0; k < 6; k++) { float a = k * 1.05f; plain.Sphere(pp + new Vector3(Mathf.Cos(a) * 0.025f, 0.1f + 0.01f * (k % 2), Mathf.Sin(a) * 0.025f), 0.022f, new Color(0.28f, 0.48f, 0.30f)); }
             }
 
-            // ---- the view: sky (opaque) and parallax layers far to near ----
-            var wc = WindowCenter;
-            sky.Quad(new Vector3(W + 45f, F - 15f, wc.z - 45f), new Vector3(W + 45f, F - 15f, wc.z + 45f),
-                     new Vector3(W + 45f, F + 45f, wc.z + 45f), new Vector3(W + 45f, F + 45f, wc.z - 45f),
-                     Vector3.left, Color.white, new Vector2(0, 0), new Vector2(1, 0), new Vector2(1, 1), new Vector2(0, 1), emissive: true);
-            AddLayer(RoomTextures.Mountains, W + 32f, wc.z, 30f, F - 4f, F + 14f);
-            AddLayer(RoomTextures.Forest, W + 16f, wc.z, 16f, F - 2f, F + 6f);
-            AddLayer(RoomTextures.NearTrees, W + 6f, wc.z, 9f, F - 1.2f, F + 7.8f);
+            // ---- the view: 3D terrain, trees, mountains and a sky dome (see CozyOutside.cs) ----
+            BuildOutside();
 
             // Lighting is ray traced on worker threads; the previous meshes stay visible until it finishes.
             floorB.Alpha = 1f - Mathf.Clamp01(Plugin.Cfg.FloorReflection.Value);
@@ -1370,6 +1364,40 @@ namespace OlliVR
                     }
                     prevStart = start;
                 }
+            }
+
+            /// <summary>A vertex with a final (unlit) colour; returns its index.</summary>
+            public int Vert(Vector3 p, Vector3 n, Color c, Vector2? uv = null) => V(p, n, uv ?? Vector2.zero, c, true, false);
+            public void Tri(int a, int b, int c) { tris.Add(a); tris.Add(b); tris.Add(c); }
+
+            /// <summary>
+            /// A (truncated) cone with per-vertex colours from colourFn(position, normal); jag > 0 makes the bottom
+            /// rim ragged (alternating radius) like drooping branches.
+            /// </summary>
+            public void ConeColoured(Vector3 basePos, float rBottom, float rTop, float height, int seg,
+                                     System.Func<Vector3, Vector3, Color> colourFn, float jag = 0f, float twist = 0f)
+            {
+                int baseIdx = pos.Count;
+                for (int i = 0; i <= seg; i++)
+                {
+                    float a = i / (float)seg * Mathf.PI * 2f + twist;
+                    var dir = new Vector3(Mathf.Cos(a), 0, Mathf.Sin(a));
+                    float rb = rBottom * (1f + ((i % 2 == 0) ? jag : -jag * 0.6f));
+                    var pb = basePos + dir * rb - Vector3.up * (jag * rBottom * 0.5f * (i % 2));
+                    var pt = basePos + dir * rTop + Vector3.up * height;
+                    var n = (dir * height + Vector3.up * (rb - rTop)).normalized;
+                    V(pb, n, Vector2.zero, colourFn(pb, n), true, false);
+                    V(pt, n, Vector2.zero, colourFn(pt, (n + Vector3.up).normalized), true, false);
+                }
+                for (int i = 0; i < seg; i++)
+                {
+                    int i0 = baseIdx + i * 2;
+                    tris.Add(i0); tris.Add(i0 + 1); tris.Add(i0 + 3);
+                    tris.Add(i0); tris.Add(i0 + 3); tris.Add(i0 + 2);
+                }
+                // Underside (seen from the low window when looking up at near trees).
+                int c = V(basePos, Vector3.down, Vector2.zero, colourFn(basePos, Vector3.down) * 0.5f, true, false);
+                for (int i = 0; i < seg; i++) { tris.Add(c); tris.Add(baseIdx + i * 2); tris.Add(baseIdx + i * 2 + 2); }
             }
 
             /// <summary>Applies a transform to every vertex added since index 'from' (positions and normals).</summary>

@@ -174,23 +174,26 @@ namespace OlliVR
             var px = new Color32[W * H];
             var top = new Color(0.01f, 0.015f, 0.05f);
             var horizon = new Color(0.10f, 0.12f, 0.24f);
-            float moonX = 0.56f * W, moonY = 0.40f * H, moonR = 11f;
+            // Matches the sky dome mapping (CozyOutside.BuildSkyDome): moon at 18 deg azimuth, 14 deg elevation.
+            // The dome stretches u about 2.2x more than v, so the moon is drawn as an ellipse to look round.
+            float moonX = 0.58f * W, moonY = 0.257f * H, moonR = 18f;
             for (int y = 0; y < H; y++)
                 for (int x = 0; x < W; x++)
                 {
                     float v = y / (float)H;
                     var c = Color.Lerp(horizon, top, Mathf.SmoothStep(0.15f, 0.75f, v));
-                    float aur = Mathf.Exp(-Mathf.Pow((v - 0.52f - 0.05f * Mathf.Sin(x * 0.012f)) / 0.035f, 2f)) *
+                    float aur = Mathf.Exp(-Mathf.Pow((v - 0.34f - 0.04f * Mathf.Sin(x * 0.012f)) / 0.05f, 2f)) *
                                 (0.5f + 0.5f * Fbm(x / 64f, 0, W / 64, 1, 71, 3));
                     c += new Color(0.05f, 0.22f, 0.12f) * aur * 0.55f;
-                    float md = Mathf.Sqrt((x - moonX) * (x - moonX) + (y - moonY) * (y - moonY));
+                    float mdx = (x - moonX) * 2.2f, mdy = y - moonY;
+                    float md = Mathf.Sqrt(mdx * mdx + mdy * mdy);
                     c += new Color(0.30f, 0.32f, 0.40f) * Mathf.Exp(-md / 40f) * 0.6f;
                     if (md < moonR) c = new Color(0.97f, 0.95f, 0.86f) * (0.92f + 0.08f * Fbm(x / 3f, y / 3f, 1000, 1000, 72, 2));
                     px[y * W + x] = C(c.r, c.g, c.b);
                 }
             for (int i = 0; i < 1400; i++)
             {
-                int x = rng.Next(W), y = (int)(H * (0.2f + 0.8f * (float)rng.NextDouble()));
+                int x = rng.Next(W), y = (int)(H * (0.14f + 0.86f * (float)rng.NextDouble()));
                 float b = 0.35f + 0.65f * (float)rng.NextDouble() * (float)rng.NextDouble();
                 px[y * W + x] = C(b, b, b * 0.95f);
             }
