@@ -22,9 +22,21 @@ namespace OlliVR
         /// <summary>Main thread: turns the generated pixels into Unity textures.</summary>
         public static void UploadAll()
         {
-            foreach (var t in new[] { White, Wood, Wallpaper, Rug, Brick, Sky, Snow, Flames, Log, Stone, Plaid, Deck, NightSky, Mountains, Forest, NearTrees, BoardGrain, Leather, Sheepskin, Painting, Halo })
+            foreach (var t in new[] { White, Wood, Wallpaper, Rug, Brick, Sky, Snow, Flames, Log, Stone, Plaid, Deck, NightSky, Mountains, Forest, NearTrees, BoardGrain, Leather, Sheepskin, Painting, Halo, Wool, Cowhide, TrailMap, Frost, Wicker, ClockFace })
                 t?.Create();
+            LitVariants.Clear();
+            foreach (var kv in relief)
+            {
+                kv.Value.albedo.Create(); kv.Value.normal.Create();
+                if (kv.Key.Tex != null) LitVariants[kv.Key.Tex.GetInstanceID()] = (kv.Value.albedo.Tex, kv.Value.normal.Tex);
+            }
         }
+
+        // For each relief texture: the albedo with only cavity darkening (the lit shader shades the relief
+        // against the real lights) and a tangent-space normal map.
+        static readonly System.Collections.Generic.Dictionary<Texture2D, (Texture2D albedo, Texture2D normal)> relief = new();
+        /// <summary>By the shaded texture's instance id: its lit-shader albedo and normal map (main thread, after UploadAll).</summary>
+        public static readonly System.Collections.Generic.Dictionary<int, (UnityEngine.Texture2D albedo, UnityEngine.Texture2D normal)> LitVariants = new();
 
         public static void Generate()
         {
@@ -39,6 +51,7 @@ namespace OlliVR
             Flames = MakeFlames();
             GenerateLodge(rng);
             GenerateLodge2(rng);
+            GenerateLodge3(rng);
         }
 
         static Texture2D Make(int w, int h, bool clamp, Func<int, int, Color32> f)
@@ -208,8 +221,39 @@ namespace OlliVR
                     var (c, ht) = f(x, y);
                     px[y * w + x] = c; hgt[y * w + x] = ht;
                 }
+            var (plain, nmap) = ReliefMaps(px, hgt, w, h, clamp, strength);
             BakeRelief(px, hgt, w, h, clamp, strength);
-            return Upload(w, h, clamp, px);
+            var shaded = Upload(w, h, clamp, px);
+            relief[shaded] = (Upload(w, h, clamp, plain), new Texture2D(w, h, clamp, nmap, linear: true));
+            return shaded;
+        }
+
+        /// <summary>Cavity-only albedo and a tangent-space normal map (x in r, y in g, a = 1) from the height.</summary>
+        static (Color32[] plain, Color32[] normal) ReliefMaps(Color32[] px, float[] hgt, int w, int h, bool clamp, float strength)
+        {
+            var plain = new Color32[w * h];
+            var nm = new Color32[w * h];
+            float H(int x, int y)
+            {
+                if (clamp) { x = Mathf.Clamp(x, 0, w - 1); y = Mathf.Clamp(y, 0, h - 1); }
+                else { x = Mod(x, w); y = Mod(y, h); }
+                return hgt[y * w + x];
+            }
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++)
+                {
+                    float hc = H(x, y);
+                    float dx = (H(x + 1, y) - H(x - 1, y)) * strength, dy = (H(x, y + 1) - H(x, y - 1)) * strength;
+                    var n = new Vector3(-dx, -dy, 1f).normalized;
+                    nm[y * w + x] = new Color32((byte)Mathf.Clamp(n.x * 127.5f + 127.5f, 0, 255), (byte)Mathf.Clamp(n.y * 127.5f + 127.5f, 0, 255),
+                                                (byte)Mathf.Clamp(n.z * 127.5f + 127.5f, 0, 255), 255);
+                    float avg = (H(x + 3, y) + H(x - 3, y) + H(x, y + 3) + H(x, y - 3)) * 0.25f;
+                    float cavity = Mathf.Clamp01(1f - Mathf.Max(0f, avg - hc) * 2.2f);
+                    float k = 0.5f + 0.5f * cavity;
+                    var c = px[y * w + x];
+                    plain[y * w + x] = new Color32((byte)Mathf.Min(255, c.r * k), (byte)Mathf.Min(255, c.g * k), (byte)Mathf.Min(255, c.b * k), c.a);
+                }
+            return (plain, nm);
         }
 
         static void BakeRelief(Color32[] px, float[] hgt, int w, int h, bool clamp, float strength)

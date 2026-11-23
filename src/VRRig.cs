@@ -98,6 +98,7 @@ namespace OlliVR
         void Update()
         {
             if (!EnsureInit()) return;
+            Plugin.Cfg.ReloadIfChanged();
 
             VRSession.PollEvents();
             if (VRSession.RecenterRequested) { VRSession.RecenterRequested = false; haveOrigin = false; }
@@ -321,11 +322,13 @@ namespace OlliVR
                 int g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1), g2 = GC.CollectionCount(2);
                 Plugin.L.LogInfo($"Ambience CPU: {ms:0.000} ms/frame (max {ambienceMaxTicks * tk:0.0}) over {ambienceFrames} frames; VR frame {vrTicks * tk / Math.Max(1, ambienceFrames):0.00} ms (max {vrMaxTicks * tk:0.0}); " +
                                  $"worst frame interval {maxDt * 1000f:0.0} ms; GC gen0/1/2 +{g0 - gc0}/+{g1 - gc1}/+{g2 - gc2}");
+                LogGpuTiming();
                 gc0 = g0; gc1 = g1; gc2 = g2; ambienceMaxTicks = 0; vrTicks = 0; vrMaxTicks = 0; maxDt = 0;
                 ambienceTicks = 0; ambienceFrames = 0;
             }
 
             if (captureRequested) { captureRequested = false; Capture(hmdPos, hmdRot); }
+            SampleGpuTiming();
 
             // The room eye frames are SteamVR's scene layer (and drive frame pacing) behind the screen.
             GL.IssuePluginEvent(VRSession.RenderEventFunc, VRSession.PrepareSubmit());
@@ -441,6 +444,33 @@ namespace OlliVR
         /// would be invisible. Draws a full-texture quad that adds 1 to alpha and leaves RGB untouched
         /// (additive blend of black with alpha 1; UNORM alpha saturates at 1).
         /// </summary>
+        // SteamVR's own frame timing: GPU time of our frames, frames the compositor dropped or reprojected.
+        uint lastTimingFrame;
+        int gpuSamples, gpuOver, droppedFrames, reprojected;
+        double gpuSum; float gpuMax;
+
+        void SampleGpuTiming()
+        {
+            if (VRSession.Headless || VRSession.Compositor == null) return;
+            var t = new Compositor_FrameTiming { m_nSize = (uint)System.Runtime.InteropServices.Marshal.SizeOf<Compositor_FrameTiming>() };
+            if (!VRSession.Compositor.GetFrameTiming(ref t, 0) || t.m_nFrameIndex == lastTimingFrame) return;
+            lastTimingFrame = t.m_nFrameIndex;
+            float gpu = t.m_flTotalRenderGpuMs;
+            gpuSum += gpu; gpuSamples++;
+            if (gpu > gpuMax) gpuMax = gpu;
+            if (gpu > 11.1f) gpuOver++;
+            droppedFrames += (int)t.m_nNumDroppedFrames;
+            if (t.m_nReprojectionFlags != 0) reprojected++;
+        }
+
+        void LogGpuTiming()
+        {
+            if (gpuSamples == 0) return;
+            Plugin.L.LogInfo($"GPU (SteamVR): {gpuSum / gpuSamples:0.00} ms/frame (max {gpuMax:0.0}), over 11.1 ms in {gpuOver}/{gpuSamples} frames; " +
+                             $"dropped {droppedFrames}, reprojected {reprojected}");
+            gpuSum = 0; gpuMax = 0; gpuSamples = 0; gpuOver = 0; droppedFrames = 0; reprojected = 0;
+        }
+
         void ForceOpaque(RenderTexture rt)
         {
             if (opaqueMat == null && !opaqueMatFailed)

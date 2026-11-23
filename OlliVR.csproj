@@ -19,6 +19,11 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Remove="unity/**" />
+    <None Remove="unity/**" />
+  </ItemGroup>
+
+  <ItemGroup>
     <Reference Include="$(BepInExDir)\core\BepInEx.Core.dll" Private="false" />
     <Reference Include="$(BepInExDir)\core\BepInEx.Unity.IL2CPP.dll" Private="false" />
     <Reference Include="$(BepInExDir)\core\BepInEx.Unity.Common.dll" Private="false" />
@@ -27,6 +32,7 @@
     <Reference Include="$(BepInExDir)\interop\Il2Cppmscorlib.dll" Private="false" />
     <Reference Include="$(BepInExDir)\interop\UnityEngine.dll" Private="false" />
     <Reference Include="$(BepInExDir)\interop\UnityEngine.CoreModule.dll" Private="false" />
+    <Reference Include="$(BepInExDir)\interop\UnityEngine.AssetBundleModule.dll" Private="false" />
     <Reference Include="$(BepInExDir)\interop\UnityEngine.UIModule.dll" Private="false" />
     <Reference Include="$(BepInExDir)\interop\UnityEngine.UI.dll" Private="false" />
     <Reference Include="$(BepInExDir)\interop\Unity.TextMeshPro.dll" Private="false" />
@@ -43,6 +49,7 @@
     <MakeDir Directories="$(PluginOutDir)" />
     <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(PluginOutDir)" />
     <Copy SourceFiles="$(SteamVRDir)\bin\win64\openvr_api.dll" DestinationFolder="$(PluginOutDir)" Condition="Exists('$(SteamVRDir)\bin\win64\openvr_api.dll')" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\shaders\ollivr_shaders" DestinationFolder="$(PluginOutDir)" Condition="Exists('$(MSBuildProjectDirectory)\shaders\ollivr_shaders')" SkipUnchangedFiles="true" />
     <Message Importance="high" Text="OlliVR deployed to $(PluginOutDir)" />
   </Target>
 

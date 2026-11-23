@@ -27,6 +27,7 @@ namespace OlliVR
         public static float Clamp(float v, float lo, float hi) => v < lo ? lo : v > hi ? hi : v;
         public static int Clamp(int v, int lo, int hi) => v < lo ? lo : v > hi ? hi : v;
         public static float Clamp01(float v) => v < 0f ? 0f : v > 1f ? 1f : v;
+        public static float Atan2Deg(float y, float x) => MathF.Atan2(y, x) * 180f / MathF.PI;
         public static float Lerp(float a, float b, float t) => a + (b - a) * Clamp01(t);
         public static float SmoothStep(float a, float b, float t)
         {
@@ -93,11 +94,11 @@ namespace OlliVR
     internal sealed class PendingTexture
     {
         public readonly int W, H;
-        public readonly bool Clamp;
+        public readonly bool Clamp, Linear;
         TexColor32[] px;
         public UnityEngine.Texture2D Tex { get; private set; }
 
-        public PendingTexture(int w, int h, bool clamp, TexColor32[] pixels) { W = w; H = h; Clamp = clamp; px = pixels; }
+        public PendingTexture(int w, int h, bool clamp, TexColor32[] pixels, bool linear = false) { W = w; H = h; Clamp = clamp; px = pixels; Linear = linear; }
 
         public void Create()
         {
@@ -133,7 +134,7 @@ namespace OlliVR
             var bytes = new byte[total];
             int off = 0;
             foreach (var l in levels) { Buffer.BlockCopy(l, 0, bytes, off, l.Length); off += l.Length; }
-            var t = new UnityEngine.Texture2D(W, H, UnityEngine.TextureFormat.RGBA32, true)
+            var t = new UnityEngine.Texture2D(W, H, UnityEngine.TextureFormat.RGBA32, true, Linear)
             {
                 hideFlags = UnityEngine.HideFlags.HideAndDontSave,
                 wrapMode = Clamp ? UnityEngine.TextureWrapMode.Clamp : UnityEngine.TextureWrapMode.Repeat,

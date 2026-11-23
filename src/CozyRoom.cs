@@ -16,7 +16,12 @@ namespace OlliVR
     /// </summary>
     internal partial class CozyRoom
     {
-        public struct Part { public Mesh Mesh; public Texture Tex; }
+        public struct Part
+        {
+            public Mesh Mesh; public Texture Tex; public float Rough, Spec, Sheen, Bump; public bool Lit;
+            // The lights that reach this part (for the lit shader; arrays always 16 long).
+            public Vector4[] LightPos, LightCol; public int LightCount;
+        }
 
         public readonly List<Part> Opaque = new();
         /// <summary>Alpha-blended scenery outside the window, far to near.</summary>
@@ -33,11 +38,13 @@ namespace OlliVR
         public readonly List<Bounds> Occluders = new();
         /// <summary>Candle flame positions (room frame) and size, drawn as animated flames each frame.</summary>
         public readonly List<(Vector3 pos, float scale)> Candles = new();
+        /// <summary>Lights with dust motes drifting in their glow: position and radius of the cloud.</summary>
+        public readonly List<(Vector3 pos, float radius)> MoteSources = new();
         /// <summary>Soft glow halos (bloom stand-in): position, radius, colour, follows the fire flicker.</summary>
         public readonly List<(Vector3 pos, float radius, Color colour, bool fire)> Glows = new();
         const float ChimW = 1.7f;
 
-        const float EaveH = 2.4f, RidgeH = 3.9f, LogR = 0.125f, LogStep = 0.24f;
+        const float EaveH = 2.4f, RidgeH = 3.9f, LogR = 0.112f, LogStep = 0.24f;
         float RoofY(float x) => Floor + EaveH + (RidgeH - EaveH) * Mathf.Clamp01(1f - Mathf.Abs(x) / RoomHalfW);
 
         // Light sources (room frame).
@@ -45,6 +52,56 @@ namespace OlliVR
         float fireOpenZ0, fireOpenZ1, fireOpenY1;
         readonly List<PointLight> lights = new();
         PointLight fire;
+
+        /// <summary>
+        /// Lights for the per-pixel shader, room frame: xyz = position, w = falloff radius; colour rgb,
+        /// w = kind (0 point, 1 lamp shade, 2 fire). The window's moonlight stays baked only.
+        /// </summary>
+        public int GetPixelLights(Vector4[] pos, Vector4[] col)
+        {
+            int n = 0;
+            foreach (var l in lights)
+            {
+                if (l.Window || n >= pos.Length) continue;
+                var p = l.Samples != null && l.Samples.Length > 0 ? l.Samples[0] : l.Pos;
+                pos[n] = new Vector4(p.x, p.y, p.z, l.Radius);
+                col[n] = new Vector4(l.Col.r, l.Col.g, l.Col.b, l.Fire ? 2f : l.Lamp ? 1f : 0f);
+                n++;
+            }
+            return n;
+        }
+
+        const int MaxLightsPerPart = 6;
+
+        /// <summary>Keeps only the lights that noticeably reach the part's bounding box (cheaper per-pixel loop).</summary>
+        void CullLights(ref Part part, MeshBuilder mb)
+        {
+            var all = new Vector4[16]; var allCol = new Vector4[16];
+            int n = GetPixelLights(all, allCol);
+            mb.GetBounds(out var mn, out var mx);
+            part.LightPos = new Vector4[16]; part.LightCol = new Vector4[16];
+            // Strength of each light at the nearest point of the part; keep the strongest few.
+            var order = new List<(float s, int j)>();
+            for (int j = 0; j < n; j++)
+            {
+                var l = all[j];
+                float dx = l.x < mn.x ? mn.x - l.x : l.x > mx.x ? l.x - mx.x : 0f;
+                float dy = l.y < mn.y ? mn.y - l.y : l.y > mx.y ? l.y - mx.y : 0f;
+                float dz = l.z < mn.z ? mn.z - l.z : l.z > mx.z ? l.z - mx.z : 0f;
+                float d = Mathf.Sqrt(dx * dx + dy * dy + dz * dz) / Mathf.Max(0.01f, l.w);
+                var c = allCol[j];
+                float strength = (0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z) * (c.w > 0.5f && c.w < 1.5f ? 1.5f : 1f) / (1f + d * d);
+                if (strength >= 0.004f) order.Add((strength, j));
+            }
+            order.Sort((a, b) => b.s.CompareTo(a.s));
+            int k = 0;
+            foreach (var (_, j) in order)
+            {
+                if (k >= MaxLightsPerPart) break;
+                part.LightPos[k] = all[j]; part.LightCol[k] = allCol[j]; k++;
+            }
+            part.LightCount = k;
+        }
 
         // The room layout uses the screen size seen at the first build; later size changes only move the TV.
         float refSw = -1f, refSh = -1f;
@@ -71,18 +128,19 @@ namespace OlliVR
             Occluders.Clear();
             Candles.Clear();
             Glows.Clear();
+            MoteSources.Clear();
             var lampCol = new Color(1.0f, 0.60f, 0.28f) * 1.9f;
             float lampZ = ZFront - 0.35f;
             lights.Add(new PointLight { Pos = new Vector3(2.35f, F + 1.42f, lampZ), Col = lampCol, Radius = 0.75f, Lamp = true });
             LampPos = new Vector3(2.35f, F + 1.42f, lampZ);
-            var chandelierPos = new Vector3(0f, F + 2.75f, 0.2f);
+            var chandelierPos = new Vector3(0f, F + 2.75f, 0.5f);   // clear of the middle truss (z -0.1)
             var chandelierSamples = new Vector3[8];
             for (int i = 0; i < 8; i++) { float a = i / 8f * Mathf.PI * 2f; chandelierSamples[i] = chandelierPos + new Vector3(Mathf.Cos(a) * 0.48f, 0.12f, Mathf.Sin(a) * 0.48f); }
             lights.Add(new PointLight { Pos = chandelierPos, Col = new Color(1.0f, 0.62f, 0.30f) * 0.55f, Radius = 1.5f, Samples = chandelierSamples });
 
             float fireZ = Mathf.Min(0.9f, ZFront - 1.2f);
-            WindowW = 2.3f; WindowH = 1.35f;
-            WindowCenter = new Vector3(W, F + 1.5f, Mathf.Min(0.25f, lampZ - 0.4f - WindowW / 2));
+            WindowW = 2.3f; WindowH = 1.25f;   // top stays below the tie beams at the eaves
+            WindowCenter = new Vector3(W, F + 1.45f, Mathf.Min(0.25f, lampZ - 0.4f - WindowW / 2));
             // Night skylight through the window (an area light over the opening, so the mullions cast shadows).
             lights.Add(new PointLight { Pos = WindowCenter, Col = new Color(0.16f, 0.22f, 0.42f) * 1.1f, Radius = 2.2f, Window = true });
 
@@ -106,6 +164,12 @@ namespace OlliVR
             var leather = new MeshBuilder(this, RoomTextures.Leather);
             var sheep = new MeshBuilder(this, RoomTextures.Sheepskin);
             var painting = new MeshBuilder(this, RoomTextures.Painting);
+            var woolB = new MeshBuilder(this, RoomTextures.Wool);
+            var cowB = new MeshBuilder(this, RoomTextures.Cowhide);
+            var mapB = new MeshBuilder(this, RoomTextures.TrailMap);
+            var wickerB = new MeshBuilder(this, RoomTextures.Wicker);
+            var clockB = new MeshBuilder(this, RoomTextures.ClockFace);
+            leather.Gloss = 0.5f;
             var wood = new MeshBuilder(this, RoomTextures.Wood);
             var logs = new MeshBuilder(this, RoomTextures.Log);
             var plain = new MeshBuilder(this, RoomTextures.White);
@@ -114,10 +178,28 @@ namespace OlliVR
             var plaid = new MeshBuilder(this, RoomTextures.Plaid);
             var deck = new MeshBuilder(this, RoomTextures.Deck);
             var sky = new MeshBuilder(this, RoomTextures.NightSky);
+            // Surface response for the lit shader (roughness, specular, sheen).
+            floorB.Surface(0.32f, 0.9f, 0f, 1.4f); // varnished floor boards
+            boards.Surface(0.65f, 0.35f, 0f, 1.8f);
+            wood.Surface(0.45f, 0.6f, 0f, 1.5f);           // oiled furniture wood
+            logs.Surface(0.75f, 0.3f, 0f, 1.8f);
+            leather.Surface(0.38f, 0.8f, 0.1f, 0.35f);
+            sheep.Surface(0.95f, 0.05f, 0.5f, 0.6f);
+            woolB.Surface(0.9f, 0.08f, 0.45f);
+            plaid.Surface(0.9f, 0.08f, 0.45f);
+            rug.Surface(0.92f, 0.05f, 0.35f);
+            cowB.Surface(0.8f, 0.15f, 0.3f);
+            stone.Surface(0.7f, 0.35f);
+            painting.Surface(0.4f, 0.35f);         // varnished canvas
+            mapB.Surface(0.75f, 0.15f);
+            clockB.Surface(0.25f, 0.6f);           // glass over the dial
+            wickerB.Surface(0.7f, 0.25f);
+            deck.Surface(0.5f, 0.5f);
+            plain.Surface(0.5f, 0.5f);
 
             var timber = new Color(0.50f, 0.34f, 0.20f);
             var pine = new Color(0.80f, 0.64f, 0.48f);
-            var chinking = new Color(0.55f, 0.48f, 0.38f);
+            var chinking = new Color(0.86f, 0.82f, 0.74f);   // pale mortar between the logs
             var iron = new Color(0.07f, 0.06f, 0.06f);
 
             // ---- floor: individual oak boards, staggered joints, a dark underlay showing in the gaps ----
@@ -133,7 +215,7 @@ namespace OlliVR
                     float z0 = Mathf.Max(z, ZBack), z1 = Mathf.Min(z + len, ZFront);
                     if (z1 - z0 > 0.05f)
                     {
-                        var tone = new Color(0.86f, 0.80f, 0.72f) * (0.88f + 0.22f * (float)rngB.NextDouble());
+                        var tone = new Color(0.62f, 0.52f, 0.44f) * (0.85f + 0.25f * (float)rngB.NextDouble());   // darker stained floor
                         floorB.Board(new Vector3(x + bw / 2, F - 0.011f, (z0 + z1) / 2), Vector3.forward, Vector3.right, Vector3.up,
                                      z1 - z0 - Gap, bw, 0.022f, tone, (float)rngB.NextDouble() * 8f, rngB.Next(4), 2.0f);
                     }
@@ -171,6 +253,27 @@ namespace OlliVR
                     logs.LogRun(new Vector3(doorRect.xMax, y, ZBack), new Vector3(W, y, ZBack), Vector3.forward, LogR, tone);
                 }
                 else logs.LogRun(new Vector3(-W, y, ZBack), new Vector3(W, y, ZBack), Vector3.forward, LogR, tone);
+                // Pale mortar (chinking) in the groove above this log, following the same openings.
+                float cy = y + LogStep / 2;
+                if (cy < logTop - 0.05f)
+                {
+                    const float CR = 0.03f;
+                    var mortar = chinking * (0.95f + 0.05f * ((row * 13) % 3));
+                    plain.LogRun(new Vector3(-W, cy, ZBack), new Vector3(-W, cy, fireZ - ChimW / 2), Vector3.right, CR, mortar);
+                    plain.LogRun(new Vector3(-W, cy, fireZ + ChimW / 2), new Vector3(-W, cy, ZFront), Vector3.right, CR, mortar);
+                    if (cy + CR > windowRect.yMin && cy - CR < windowRect.yMax)
+                    {
+                        plain.LogRun(new Vector3(W, cy, ZBack), new Vector3(W, cy, windowRect.xMin), Vector3.left, CR, mortar);
+                        plain.LogRun(new Vector3(W, cy, windowRect.xMax), new Vector3(W, cy, ZFront), Vector3.left, CR, mortar);
+                    }
+                    else plain.LogRun(new Vector3(W, cy, ZBack), new Vector3(W, cy, ZFront), Vector3.left, CR, mortar);
+                    if (cy - CR < doorRect.yMax)
+                    {
+                        plain.LogRun(new Vector3(-W, cy, ZBack), new Vector3(doorRect.xMin, cy, ZBack), Vector3.forward, CR, mortar);
+                        plain.LogRun(new Vector3(doorRect.xMax, cy, ZBack), new Vector3(W, cy, ZBack), Vector3.forward, CR, mortar);
+                    }
+                    else plain.LogRun(new Vector3(-W, cy, ZBack), new Vector3(W, cy, ZBack), Vector3.forward, CR, mortar);
+                }
             }
 
             // ---- board walls: the dark-stained feature wall behind the TV (full gable) and the back gable ----
@@ -201,27 +304,38 @@ namespace OlliVR
                 float bw = Mathf.Min(RoofBoardW, slopeLen - s);
                 var cL = new Vector3(-W, F + EaveH, (ZFront + ZBack) / 2) + slopeL * (s + bw / 2) - nL * 0.011f;
                 var cR = new Vector3(W, F + EaveH, (ZFront + ZBack) / 2) + slopeR * (s + bw / 2) - nR * 0.011f;
-                boards.Board(cL, Vector3.forward, slopeL, nL, ZFront - ZBack, bw, 0.022f, pine * (0.82f + 0.2f * (float)rngB.NextDouble()),
+                boards.Board(cL, Vector3.forward, slopeL, nL, ZFront - ZBack, bw, 0.022f, new Color(0.92f, 0.86f, 0.76f) * (0.86f + 0.14f * (float)rngB.NextDouble()),
                              (float)rngB.NextDouble() * 8f, rngB.Next(4), 2.0f);
-                boards.Board(cR, Vector3.forward, slopeR, nR, ZFront - ZBack, bw, 0.022f, pine * (0.82f + 0.2f * (float)rngB.NextDouble()),
+                boards.Board(cR, Vector3.forward, slopeR, nR, ZFront - ZBack, bw, 0.022f, new Color(0.92f, 0.86f, 0.76f) * (0.86f + 0.14f * (float)rngB.NextDouble()),
                              (float)rngB.NextDouble() * 8f, rngB.Next(4), 2.0f);
             }
-            logs.Box(new Vector3(0, F + RidgeH - 0.14f, (ZFront + ZBack) / 2), new Vector3(0.2f, 0.26f, ZFront - ZBack), timber);
-            float angle = Mathf.Atan2(rise, W) * Mathf.Rad2Deg;
-            for (float z = ZBack + 0.9f; z < ZFront - 0.5f; z += 1.6f)
+            // Round, peeled-log timbers: ridge, and per truss a tie beam, king post, rafters and braces.
+            var logTimber = new Color(0.62f, 0.45f, 0.30f);
+            logs.RodLog(new Vector3(0, F + RidgeH - 0.13f, ZBack), new Vector3(0, F + RidgeH - 0.13f, ZFront), 0.12f, logTimber);
+            // Trusses placed clear of the chimney (z 0.05..1.75): back, middle and front.
+            // The front truss stands in the TV's plane (behind it the wall logs, in front the chimney), so it has a
+            // collar beam high between the rafters instead of a tie beam across the top of the TV.
+            foreach (var z in new[] { ZBack + 0.9f, -0.1f, ZFront - 0.35f })
             {
-                // Tie beam at eave height, king post, and a rafter under each slope.
-                logs.Box(new Vector3(0, F + EaveH - 0.09f, z), new Vector3(2 * W, 0.18f, 0.16f), timber);
-                logs.Box(new Vector3(0, F + EaveH + rise / 2, z), new Vector3(0.14f, rise, 0.14f), timber);
-                var midL = new Vector3(-W / 2, F + EaveH + rise / 2, z) + new Vector3(rise, -W, 0).normalized * 0.11f;
-                var midR = new Vector3(W / 2, F + EaveH + rise / 2, z) + new Vector3(-rise, -W, 0).normalized * 0.11f;
-                logs.BoxRotated(midL, new Vector3(slopeLen, 0.2f, 0.15f), Quaternion.Euler(0, 0, angle), timber);
-                logs.BoxRotated(midR, new Vector3(slopeLen, 0.2f, 0.15f), Quaternion.Euler(0, 0, -angle), timber);
-                // Angled braces from the king post to the tie beam.
-                logs.BoxRotated(new Vector3(-0.45f, F + EaveH + 0.35f, z), new Vector3(1.0f, 0.1f, 0.1f), Quaternion.Euler(0, 0, 40f), timber * 0.95f);
-                logs.BoxRotated(new Vector3(0.45f, F + EaveH + 0.35f, z), new Vector3(1.0f, 0.1f, 0.1f), Quaternion.Euler(0, 0, -40f), timber * 0.95f);
+                bool front = z > 0.5f;
+                var inL = new Vector3(rise, -W, 0).normalized * 0.1f;
+                var inR = new Vector3(-rise, -W, 0).normalized * 0.1f;
+                logs.RodLog(new Vector3(-W, F + EaveH, z) + inL, new Vector3(0, F + RidgeH, z) + inL, 0.09f, logTimber);
+                logs.RodLog(new Vector3(W, F + EaveH, z) + inR, new Vector3(0, F + RidgeH, z) + inR, 0.09f, logTimber);
+                if (front)
+                {
+                    float collarY = Mathf.Min(Mathf.Max(F + EaveH + 0.5f, tvCentre.y + tvHalfH + 0.3f), F + RidgeH - 0.45f);
+                    float xr = W * (1f - (collarY - F - EaveH) / (RidgeH - EaveH)) - 0.08f;   // inside the rafters
+                    logs.RodLog(new Vector3(-xr, collarY, z), new Vector3(xr, collarY, z), 0.08f, logTimber);
+                    logs.RodLog(new Vector3(0, collarY, z), new Vector3(0, F + RidgeH - 0.2f, z), 0.065f, logTimber);
+                    continue;
+                }
+                float tieY = F + EaveH - 0.07f;
+                logs.RodLog(new Vector3(-W, tieY, z), new Vector3(W, tieY, z), 0.095f, logTimber);
+                logs.RodLog(new Vector3(0, tieY, z), new Vector3(0, F + RidgeH - 0.2f, z), 0.075f, logTimber);
+                logs.RodLog(new Vector3(-0.85f, tieY, z), new Vector3(-0.06f, F + EaveH + 0.75f, z), 0.055f, logTimber * 0.95f);
+                logs.RodLog(new Vector3(0.85f, tieY, z), new Vector3(0.06f, F + EaveH + 0.75f, z), 0.055f, logTimber * 0.95f);
             }
-
             // ---- rug ----
             float rugZ = Mathf.Lerp(0f, ZFront - 0.5f, 0.45f);
             rug.Quad(new Vector3(-1.5f, F + 0.006f, rugZ - 1.0f), new Vector3(1.5f, F + 0.006f, rugZ - 1.0f),
@@ -339,6 +453,8 @@ namespace OlliVR
                 // Bright inside, seen through the openings.
                 plain.Cylinder(shadeBase, 0.214f, 0.194f, 0.34f, new Color(1.0f, 0.82f, 0.55f), 24, emissive: true, open: true, inward: true);
                 plain.Sphere(l.Pos, 0.035f, new Color(1f, 0.95f, 0.85f), emissive: true);
+                Glows.Add((l.Pos, 0.85f, new Color(0.035f, 0.022f, 0.009f), false));   // warm haze around the lamp
+                MoteSources.Add((l.Pos - Vector3.up * 0.3f, 0.9f));
             }
 
             // ---- river-stone chimney and fireplace (left wall) ----
@@ -368,7 +484,7 @@ namespace OlliVR
             plain.LogZ(new Vector3(cx0 + 0.24f, oy0 + 0.06f, fz), 0.055f, 0.6f, logCol);
             plain.LogZ(new Vector3(cx0 + 0.32f, oy0 + 0.06f, fz + 0.05f), 0.05f, 0.5f, logCol * 0.9f);
             plain.Box(new Vector3(cx0 + 0.28f, oy0 + 0.012f, fz), new Vector3(0.3f, 0.02f, 0.6f), new Color(1.0f, 0.35f, 0.08f), emissive: true);
-            // Hearth slab and a rough timber mantel with candles and a lantern.
+            // Hearth slab and a rough timber mantel with candles.
             stone.Box(new Vector3((cx0 + cx1 + 0.4f) / 2, F + 0.03f, fz), new Vector3(cx1 - cx0 + 0.4f, 0.06f, cw + 0.3f), stoneCol * 0.85f);
             float mantelY = F + 1.2f;
             logs.Box(new Vector3((cx0 + cx1 + 0.14f) / 2, mantelY, fz), new Vector3(cx1 - cx0 + 0.14f, 0.14f, cw + 0.25f), timber);
@@ -380,7 +496,6 @@ namespace OlliVR
                 plain.Cylinder(cp + new Vector3(0, ch, 0), 0.0035f, 0.0035f, 0.012f, new Color(0.08f, 0.06f, 0.05f), 6);
                 AddCandle(cp + new Vector3(0, ch + 0.012f, 0), 1f, 0.35f);
             }
-            Lantern(plain, new Vector3(cx1 + 0.07f, mantelY + 0.07f, fz + 0.15f), iron);
             // Evergreen garland with warm fairy lights, draped in two swags along the front of the mantel.
             {
                 float gz0 = fz - cw / 2 - 0.05f, gz1 = fz + cw / 2 + 0.05f, gx = cx1 + 0.16f;
@@ -402,16 +517,18 @@ namespace OlliVR
                 }
                 lights.Add(new PointLight { Pos = new Vector3(gx + 0.08f, mantelY - 0.1f, fz), Col = new Color(1.0f, 0.65f, 0.32f) * 0.16f, Radius = 0.8f });
             }
-            // Firewood stacked beside the chimney.
+            // Firewood stacked beside the chimney, fitted between the hearth slab and the front wall's logs.
             var rngW = new System.Random(11);
-            AddOcc(new Vector3(-W + LogR + 0.27f, F + 0.25f, fz + cw / 2 + 0.35f), new Vector3(0.5f, 0.5f, 0.48f));
-            float wz = fz + cw / 2 + 0.32f;
+            float pileZ0 = fz + (cw + 0.3f) / 2 + 0.02f, pileZ1 = ZFront - LogR - 0.02f;
+            float wlen = Mathf.Clamp(pileZ1 - pileZ0 - 0.03f, 0.2f, 0.48f);
+            float wz = (pileZ0 + pileZ1) / 2 - 0.015f;
+            AddOcc(new Vector3(-W + LogR + 0.27f, F + 0.25f, wz + 0.015f), new Vector3(0.5f, 0.5f, wlen + 0.03f));
             for (int r = 0; r < 4; r++)
                 for (int i = 0; i < 4 - r; i++)
                 {
                     float lx = -W + LogR + 0.08f + i * 0.13f + r * 0.065f, ly = F + 0.065f + r * 0.115f;
                     var lc = new Color(0.42f, 0.28f, 0.17f) * (0.8f + 0.4f * (float)rngW.NextDouble());
-                    plain.LogZ(new Vector3(lx, ly, wz + 0.03f * ((i + r) % 2)), 0.062f, 0.48f, lc);
+                    plain.LogZ(new Vector3(lx, ly, wz + 0.03f * ((i + r) % 2)), 0.062f, wlen, lc);
                 }
 
             // ---- wrought-iron chandelier under the ridge ----
@@ -455,9 +572,9 @@ namespace OlliVR
             plain.Cylinder(side, 0.16f, 0.13f, 0.04f, timber * 0.7f, 24);
             AddOcc(side + new Vector3(0, 0.27f, 0), new Vector3(0.3f, 0.5f, 0.3f));
             float st = F + 0.555f;
-            plain.RoundBox(new Vector3(side.x - 0.05f, st + 0.02f, side.z - 0.03f), new Vector3(0.2f, 0.04f, 0.14f), 0.006f, new Color(0.25f, 0.32f, 0.45f), Quaternion.Euler(0, 12f, 0), occ: false);
-            plain.RoundBox(new Vector3(side.x - 0.05f, st + 0.055f, side.z - 0.03f), new Vector3(0.18f, 0.03f, 0.13f), 0.006f, new Color(0.60f, 0.20f, 0.16f), Quaternion.Euler(0, -5f, 0), occ: false);
-            Mug(plain, new Vector3(side.x + 0.12f, st, side.z + 0.06f), new Color(0.88f, 0.86f, 0.80f));
+            plain.RoundBox(new Vector3(side.x + 0.05f, st + 0.02f, side.z + 0.1f), new Vector3(0.2f, 0.04f, 0.14f), 0.006f, new Color(0.25f, 0.32f, 0.45f), Quaternion.Euler(0, 12f, 0), occ: false);
+            plain.RoundBox(new Vector3(side.x + 0.05f, st + 0.055f, side.z + 0.1f), new Vector3(0.18f, 0.03f, 0.13f), 0.006f, new Color(0.60f, 0.20f, 0.16f), Quaternion.Euler(0, -5f, 0), occ: false);
+            Mug(plain, new Vector3(side.x + 0.14f, st, side.z - 0.08f), new Color(0.88f, 0.86f, 0.80f));
 
             // ---- coffee table on the rug: thick top, turned legs; a gamepad, a mug, a book and a candle jar ----
             var ct = new Vector3(0f, F, 1.08f);
@@ -612,12 +729,17 @@ namespace OlliVR
                 for (int k = 0; k < 6; k++) { float a = k * 1.05f; plain.Sphere(pp + new Vector3(Mathf.Cos(a) * 0.025f, 0.1f + 0.01f * (k % 2), Mathf.Sin(a) * 0.025f), 0.022f, new Color(0.28f, 0.48f, 0.30f)); }
             }
 
+            // ---- lived-in details, extra lights and the sofa (see CozyDecor.cs) ----
+            BuildDecor(new Kit { Plain = plain, Logs = logs, Boards = boards, Leather = leather, Plaid = plaid, Stone = stone, Painting = painting,
+                                 Wool = woolB, Cowhide = cowB, Map = mapB, Wicker = wickerB, Clock = clockB },
+                       F, doorRect, windowRect, fz, cx1, mantelY, cw, side);
+
             // ---- the view: 3D terrain, trees, mountains and a sky dome (see CozyOutside.cs) ----
             BuildOutside();
 
             // Lighting is ray traced on worker threads; the previous meshes stay visible until it finishes.
             floorB.Alpha = 1f - Mathf.Clamp01(Plugin.Cfg.FloorReflection.Value);
-            StartBake(new[] { floorB, boards, wood, logs, plain, rug, stone, plaid, deck, leather, sheep, painting, sky });
+            StartBake(new[] { floorB, boards, wood, logs, plain, rug, stone, plaid, deck, leather, sheep, painting, woolB, cowB, mapB, wickerB, clockB, sky });
         }
 
         /// <summary>
@@ -703,7 +825,6 @@ namespace OlliVR
                       new Vector2(0, 0), new Vector2(1, 0), new Vector2(1, 1), new Vector2(0, 1), false, 6, 5);
         }
 
-        /// <summary>A small iron lantern with a glowing glass box.</summary>
         /// <summary>Registers a candle flame (drawn animated each frame) and, optionally, its small warm light.</summary>
         void AddCandle(Vector3 wickTop, float scale, float light)
         {
@@ -713,6 +834,7 @@ namespace OlliVR
                 lights.Add(new PointLight { Pos = wickTop + new Vector3(0, 0.03f, 0), Col = new Color(1.0f, 0.62f, 0.30f) * light, Radius = 0.5f });
         }
 
+        /// <summary>A small iron lantern with a glowing glass box.</summary>
         void Lantern(MeshBuilder b, Vector3 basePos, Color iron)
         {
             b.Box(basePos + new Vector3(0, 0.01f, 0), new Vector3(0.12f, 0.02f, 0.12f), iron);
@@ -790,6 +912,10 @@ namespace OlliVR
                 HasTv = true, TvCentre = N3(tvCentre), TvHalfW = tvHalfW, TvHalfH = tvHalfH,
             };
             b.Occluders.AddRange(bakeOcc);
+            // Diagnostics: solid objects that pass through each other (more than 2 cm).
+            foreach (var (oa, ob, depth) in LightBaker.FindOverlaps(bakeOcc, 0.02f))
+                Plugin.L.LogInfo($"Overlap {depth * 100f:0} cm: box at ({oa.C.X:0.00},{oa.C.Y - Floor:0.00},{oa.C.Z:0.00}) size ({oa.H.X * 2:0.00},{oa.H.Y * 2:0.00},{oa.H.Z * 2:0.00}) "
+                                 + $"and box at ({ob.C.X:0.00},{ob.C.Y - Floor:0.00},{ob.C.Z:0.00}) size ({ob.H.X * 2:0.00},{ob.H.Y * 2:0.00},{ob.H.Z * 2:0.00})");
             foreach (var l in lights)
             {
                 var bl = new LightBaker.Light { Col = new System.Numerics.Vector3(l.Col.r, l.Col.g, l.Col.b), Radius = l.Radius };
@@ -828,7 +954,7 @@ namespace OlliVR
             int total = 0;
             foreach (var mb in builders) total += mb.Count;
             b.P = new System.Numerics.Vector3[total]; b.N = new System.Numerics.Vector3[total]; b.Tint = new System.Numerics.Vector3[total];
-            b.Emissive = new bool[total]; b.NoAo = new bool[total];
+            b.Emissive = new bool[total]; b.NoAo = new bool[total]; b.Gloss = new float[total];
             int off = 0;
             foreach (var mb in builders) { mb.Export(b, off); off += mb.Count; }
 
@@ -853,7 +979,12 @@ namespace OlliVR
             int off = 0;
             foreach (var mb in pendingBuilders)
             {
-                if (mb.Count > 0) Opaque.Add(new Part { Mesh = mb.ToMesh(baker.Base, off), Tex = mb.Tex });
+                if (mb.Count > 0)
+                {
+                    var part = new Part { Mesh = mb.ToMesh(baker.Base, off), Tex = mb.Tex, Rough = mb.Rough, Spec = mb.Spec, Sheen = mb.Sheen, Bump = mb.Bump, Lit = mb != pendingBuilders[pendingBuilders.Length - 1] };
+                    if (part.Lit) CullLights(ref part, mb);
+                    Opaque.Add(part);
+                }
                 off += mb.Count;
             }
             // Fire flicker: every lit surface (the sky is last and excluded), fire contribution only.
@@ -881,6 +1012,17 @@ namespace OlliVR
             readonly List<bool> emissive = new(), shell = new();
             readonly List<int> tris = new();
             public int Count => pos.Count;
+
+            public void GetBounds(out Vector3 min, out Vector3 max)
+            {
+                float x0 = float.MaxValue, y0 = float.MaxValue, z0 = float.MaxValue, x1 = float.MinValue, y1 = float.MinValue, z1 = float.MinValue;
+                foreach (var p in pos)
+                {
+                    float x = p.x, y = p.y, z = p.z;
+                    if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; if (z < z0) z0 = z; if (z > z1) z1 = z;
+                }
+                min = new Vector3(x0, y0, z0); max = new Vector3(x1, y1, z1);
+            }
 
             public MeshBuilder(CozyRoom r, Texture t) { room = r; Tex = t; }
 
@@ -1293,6 +1435,54 @@ namespace OlliVR
                 if (occ && !emissive) room.AddOcc(c, rot * Vector3.right, rot * Vector3.up, rot * Vector3.forward, h * 0.95f);
             }
 
+            /// <summary>
+            /// A round peeled log from a to b with the log texture running along it, slightly irregular, end caps,
+            /// and registered as a shadow caster (oriented box along its axis).
+            /// </summary>
+            public void RodLog(Vector3 a, Vector3 b, float r, Color col)
+            {
+                var axis = b - a;
+                float len = axis.magnitude;
+                if (len < 1e-3f) return;
+                var dir = axis / len;
+                var side = Mathf.Abs(dir.y) < 0.9f ? Vector3.Cross(dir, Vector3.up).normalized : Vector3.Cross(dir, Vector3.right).normalized;
+                var up = Vector3.Cross(side, dir);
+                const int Seg = 14;
+                int along = Mathf.Clamp(Mathf.CeilToInt(len / 0.12f), 1, 80);
+                float seed = (a.x * 3.1f + a.y * 7.7f + a.z * 5.3f) % 6.28f;
+                int baseIdx = pos.Count;
+                for (int j = 0; j <= along; j++)
+                {
+                    float t = j / (float)along, s = t * len;
+                    float wob = 1f + 0.05f * Mathf.Sin(s * 1.7f + seed) + 0.025f * Mathf.Sin(s * 4.1f + seed * 2f);
+                    for (int i = 0; i <= Seg; i++)
+                    {
+                        float th = i / (float)Seg * Mathf.PI * 2f;
+                        var n = side * Mathf.Cos(th) + up * Mathf.Sin(th);
+                        V(a + axis * t + n * (r * wob * (1f + 0.015f * Mathf.Sin(th * 3f + s))), n, new Vector2(s / 1.6f + seed, i / (float)Seg), col, false, false);
+                    }
+                }
+                for (int j = 0; j < along; j++)
+                    for (int i = 0; i < Seg; i++)
+                    {
+                        int i0 = baseIdx + j * (Seg + 1) + i, i1 = i0 + Seg + 1;
+                        tris.Add(i0); tris.Add(i1); tris.Add(i1 + 1);
+                        tris.Add(i0); tris.Add(i1 + 1); tris.Add(i0 + 1);
+                    }
+                foreach (var (end, nd) in new[] { (a, -dir), (b, dir) })
+                {
+                    int ci = V(end, nd, new Vector2(0.5f, 0.5f), col * 0.8f, false, false);
+                    for (int i = 0; i < Seg; i++)
+                    {
+                        float t0 = i / (float)Seg * Mathf.PI * 2f, t1 = (i + 1) / (float)Seg * Mathf.PI * 2f;
+                        int p0 = V(end + (side * Mathf.Cos(t0) + up * Mathf.Sin(t0)) * r, nd, Vector2.zero, col * 0.8f, false, false);
+                        int p1 = V(end + (side * Mathf.Cos(t1) + up * Mathf.Sin(t1)) * r, nd, Vector2.zero, col * 0.8f, false, false);
+                        tris.Add(ci); tris.Add(p0); tris.Add(p1);
+                    }
+                }
+                room.AddOcc((a + b) / 2, dir, side, up, new Vector3(len / 2, r * 0.9f, r * 0.9f));
+            }
+
             /// <summary>Horizontal cylinder along an arbitrary axis (rounded rails, handles, poles, legs).</summary>
             public void Rod(Vector3 a, Vector3 b, float r, Color col, int seg = 10, bool caps = true)
             {
@@ -1333,7 +1523,7 @@ namespace OlliVR
             }
 
             /// <summary>An irregular, slightly domed flat shape lying on the floor (a sheepskin).</summary>
-            public void Blob(Vector3 c, float rx, float rz, Color col, int seed)
+            public void Blob(Vector3 c, float rx, float rz, Color col, int seed, float uvSpan = 1f)
             {
                 const int Seg = 40, Rings = 5;
                 int centre = V(c + Vector3.up * 0.012f, Vector3.up, new Vector2(0.5f, 0.5f), col, false, false);
@@ -1349,7 +1539,7 @@ namespace OlliVR
                         var off = new Vector3(Mathf.Cos(a) * rx, 0, Mathf.Sin(a) * rz) * (f * (k == Rings ? wob : 1f + (wob - 1f) * f));
                         float hgt = 0.012f * (1f - f * f);
                         var nn = (Vector3.up + off.normalized * (0.6f * f)).normalized;
-                        V(c + off + Vector3.up * hgt, nn, new Vector2(off.x / 0.5f + 0.5f, off.z / 0.5f + 0.5f), col, false, false);
+                        V(c + off + Vector3.up * hgt, nn, new Vector2(off.x / uvSpan + 0.5f, off.z / uvSpan + 0.5f), col, false, false);
                     }
                     for (int i = 0; i < Seg; i++)
                     {
@@ -1368,6 +1558,10 @@ namespace OlliVR
 
             /// <summary>A vertex with a final (unlit) colour; returns its index.</summary>
             public int Vert(Vector3 p, Vector3 n, Color c, Vector2? uv = null) => V(p, n, uv ?? Vector2.zero, c, true, false);
+            /// <summary>A vertex lit by the bake (tint col).</summary>
+            public int VertLit(Vector3 p, Vector3 n, Color c, Vector2 uv) => V(p, n, uv, c, false, false);
+            /// <summary>Glossiness for the baked highlight (0 = matte).</summary>
+            public float Gloss;
             public void Tri(int a, int b, int c) { tris.Add(a); tris.Add(b); tris.Add(c); }
 
             /// <summary>
@@ -1503,6 +1697,10 @@ namespace OlliVR
             /// <summary>Opacity written into the vertex colours (the floor is partly see-through to its reflection).</summary>
             public float Alpha = 1f;
 
+            /// <summary>Lit-shader response: roughness, specular strength, fabric sheen.</summary>
+            public float Rough = 0.7f, Spec = 0.3f, Sheen, Bump = 1f;
+            public void Surface(float rough, float spec, float sheen = 0f, float bump = 1f) { Rough = rough; Spec = spec; Sheen = sheen; Bump = bump; }
+
             /// <summary>Copies this builder's vertices into the baker's arrays at the given offset.</summary>
             public void Export(LightBaker b, int off)
             {
@@ -1513,6 +1711,7 @@ namespace OlliVR
                     b.Tint[off + i] = new System.Numerics.Vector3(tint[i].r, tint[i].g, tint[i].b);
                     b.Emissive[off + i] = emissive[i];
                     b.NoAo[off + i] = false;
+                    b.Gloss[off + i] = Gloss;
                 }
             }
 
@@ -1540,11 +1739,11 @@ namespace OlliVR
             Mesh Build(Color[] c)
             {
                 int n = pos.Count;
-                var v = new Vector3[n]; var t = new Vector2[n];
-                for (int i = 0; i < n; i++) { v[i] = pos[i]; t[i] = uv[i]; }
+                var v = new Vector3[n]; var t = new Vector2[n]; var nn = new Vector3[n];
+                for (int i = 0; i < n; i++) { v[i] = pos[i]; t[i] = uv[i]; nn[i] = nrm[i]; }
                 var m = new Mesh { name = "OlliVR_Room", hideFlags = HideFlags.HideAndDontSave };
                 if (n > 65000) m.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
-                m.vertices = v; m.uv = t; m.colors = c;
+                m.vertices = v; m.normals = nn; m.uv = t; m.colors = c;
                 m.triangles = tris.ToArray();
                 m.bounds = new Bounds(Vector3.zero, Vector3.one * 1000f);
                 m.UploadMeshData(true);

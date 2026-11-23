@@ -32,6 +32,37 @@ namespace OlliVR
         readonly CozyRoom room = new();
         RenderTexture mipSource, glowRaw, glowSmooth, msaaL, msaaR, reflL, reflR, avgRaw, avgSmooth;
         Material depthMat, texMat, texMatZ, glowMat, addMat, glowLitMat, tvMat;
+        // Per-pixel lit room shader from our AssetBundle (null: baked lighting through UI/Default).
+        Material litMat;
+        static readonly int IdLightPos = Shader.PropertyToID("_OlliLightPos"), IdLightCol = Shader.PropertyToID("_OlliLightCol"),
+            IdLightCount = Shader.PropertyToID("_OlliLightCount"), IdEye = Shader.PropertyToID("_OlliEye"), IdFire = Shader.PropertyToID("_OlliFire"),
+            IdBump = Shader.PropertyToID("_BumpMap"), IdBumpScale = Shader.PropertyToID("_BumpScale"), IdRough = Shader.PropertyToID("_Roughness"),
+            IdSpec = Shader.PropertyToID("_Specular"), IdSheen = Shader.PropertyToID("_Sheen");
+
+        /// <summary>Loads OlliVR/RoomLit from the ollivr_shaders bundle next to the plugin.</summary>
+        static Material LoadLitMaterial()
+        {
+            try
+            {
+                var dir = System.IO.Path.GetDirectoryName(typeof(Plugin).Assembly.Location);
+                var path = System.IO.Path.Combine(dir ?? "", "ollivr_shaders");
+                if (!System.IO.File.Exists(path)) { Plugin.L.LogWarning($"Lit shader bundle not found at {path}; baked lighting only."); return null; }
+                var bundle = AssetBundle.LoadFromFile(path);
+                if (bundle == null) { Plugin.L.LogWarning("Lit shader bundle failed to load."); return null; }
+                var obj = bundle.LoadAsset("Assets/Shaders/RoomLit.shader", Il2CppInterop.Runtime.Il2CppType.Of<Shader>());
+                var shader = obj != null ? obj.TryCast<Shader>() : Shader.Find("OlliVR/RoomLit");
+                if (shader == null || !shader.isSupported) { Plugin.L.LogWarning("Lit shader missing or unsupported; baked lighting only."); return null; }
+                var m = new Material(shader) { hideFlags = HideFlags.HideAndDontSave };
+                Object.DontDestroyOnLoad(m);
+                Plugin.L.LogInfo($"Lit room shader loaded ({shader.name}, {m.passCount} pass).");
+                return m;
+            }
+            catch (System.Exception e)
+            {
+                Plugin.L.LogWarning("Lit shader load failed: " + e.Message);
+                return null;
+            }
+        }
         bool glowAdditive;
         int glowPass;
         Matrix4x4 projL, projR;
@@ -84,6 +115,7 @@ namespace OlliVR
             addMat = ColoredMat(colored, BlendMode.One, BlendMode.One, zWrite: false, CompareFunction.LessEqual);
             texMat = TexturedMat(textured, CompareFunction.Always);
             texMatZ = TexturedMat(textured, CompareFunction.LessEqual);
+            litMat = LoadLitMaterial();   // used while LitShader is on (checked live)
 
             // An additive textured shader makes the screen glow add light instead of tinting; fall back otherwise.
             // Additive textured light: Particles/Standard Unlit has configurable blending, so light is added on
@@ -299,6 +331,7 @@ namespace OlliVR
             UpdateSparks(dt);
             var headLocal = Quaternion.Inverse(originRot) * hmdRot;
             UpdateSnowfall(dt, headLocal * Vector3.right, headLocal * Vector3.up);
+            UpdateMotes(dt, headLocal * Vector3.right, headLocal * Vector3.up);
             lastScreenImg = screen.StereoTexture;
             RenderEye(msaaL, reflL, hmdPos + hmdRot * eyePosL, hmdRot * eyeRotL, projL, roomM, originRot, floorY, glow, reflection, screen.StereoTexture, 0f, 0.5f);
             msaaL.ResolveAntiAliasedSurface(Left);
@@ -319,9 +352,9 @@ namespace OlliVR
             reflCap.mipMapBias = 1.0f;
             var proj = Matrix4x4.Perspective(90f, 1.6f, 0.05f, 3000f);
             var roomM = Matrix4x4.TRS(lastOriginPos, lastOriginRot, Vector3.one);
-            foreach (var (name, yaw) in new[] { ("Left", -75f), ("Ahead", 0f), ("Right", 75f), ("Behind", 180f) })
+            foreach (var (name, yaw, pitch) in new[] { ("Left", -75f, 12f), ("Ahead", 0f, 12f), ("Right", 75f, 12f), ("Behind", 180f, 12f), ("Down", -35f, 55f) })
             {
-                var rot = lastOriginRot * Quaternion.Euler(12f, yaw, 0f);
+                var rot = lastOriginRot * Quaternion.Euler(pitch, yaw, 0f);
                 RenderEye(rt, reflCap, lastOriginPos, rot, proj, roomM, lastOriginRot, lastFloorY, lastGlow, lastReflection, lastScreenImg, 0f, 0.5f);
                 DrawScreenForCapture(rt, lastOriginPos, rot, proj, roomM, screenImage);
                 save(rt, System.IO.Path.Combine(dir, $"OlliVR_capture_Room{name}.png"));
@@ -433,10 +466,41 @@ namespace OlliVR
                        Texture screenImg, float su0, float su1, bool main)
         {
             GL.modelview = view;
-            // Opaque room: depth first (no colour), then textures where the depth matches.
+            // Opaque room. Baked parts: depth, then texture where the depth matches. With the lit shader (main
+            // view only; the blurred floor reflection keeps the cheap baked look): depth for all lit parts first,
+            // so the per-pixel lighting only runs on pixels that end up visible.
+            bool lit = main && litMat != null && Plugin.Cfg.LitShader.Value;
+            if (lit)
+            {
+                // The eye in this pass's model space.
+                var litEye = model.inverse.MultiplyPoint3x4(view.inverse.MultiplyPoint3x4(Vector3.zero));
+                litMat.SetVector(IdEye, new Vector4(litEye.x, litEye.y, litEye.z, 1f));
+                litMat.SetFloat(IdFire, 0.55f + 0.45f * fireIntensity);   // steady baked part + live flicker
+                depthMat.SetPass(0);
+                for (int i = firstPart; i < room.Opaque.Count; i++)
+                    if (room.Opaque[i].Lit) Graphics.DrawMeshNow(room.Opaque[i].Mesh, model);
+            }
             for (int i = firstPart; i < room.Opaque.Count; i++)
             {
                 var part = room.Opaque[i];
+                if (lit && part.Lit)
+                {
+                    var tex = part.Tex;
+                    Texture bump = null;
+                    if (tex != null && RoomTextures.LitVariants.TryGetValue(tex.GetInstanceID(), out var v)) { tex = v.albedo; bump = v.normal; }
+                    litMat.mainTexture = tex;
+                    litMat.SetTexture(IdBump, bump);
+                    litMat.SetFloat(IdBumpScale, bump != null ? part.Bump : 0f);
+                    litMat.SetFloat(IdRough, part.Rough);
+                    litMat.SetFloat(IdSpec, part.Spec);
+                    litMat.SetFloat(IdSheen, part.Sheen);
+                    litMat.SetVectorArray(IdLightPos, part.LightPos);
+                    litMat.SetVectorArray(IdLightCol, part.LightCol);
+                    litMat.SetInt(IdLightCount, part.LightCount);
+                    litMat.SetPass(0);
+                    Graphics.DrawMeshNow(part.Mesh, model);
+                    continue;
+                }
                 depthMat.SetPass(0);
                 Graphics.DrawMeshNow(part.Mesh, model);
                 texMatZ.mainTexture = part.Tex;
@@ -514,6 +578,7 @@ namespace OlliVR
             DrawFlames();
             DrawCandleFlames(eyeLocal);
             DrawSnowfall(view, model);
+            if (main) DrawMotes(view, model);
             if (screenImg != null) DrawScreenQuad(screenImg, su0, su1);
             if (main)
             {
@@ -586,7 +651,8 @@ namespace OlliVR
                 float k = g.fire ? fireIntensity : 1f;
                 var p = N3(g.pos);
                 var toEye = System.Numerics.Vector3.Normalize(eye - p);
-                var c = p + toEye * System.MathF.Min(g.radius * 0.8f, 0.25f);
+                // Pulled towards the eye just enough not to clip into the surface right behind the light.
+                var c = p + toEye * System.MathF.Min(g.radius * 0.5f, 0.08f);
                 var r = right * g.radius; var u = up * g.radius;
                 var a = c - r - u; var b = c - r + u; var d = c + r + u; var e = c + r - u;
                 haloV[i * 4] = new Vector3(a.X, a.Y, a.Z); haloV[i * 4 + 1] = new Vector3(b.X, b.Y, b.Z);
@@ -786,6 +852,97 @@ namespace OlliVR
             m.SetPass(m == glowMat ? glowPass : 0);
             GL.modelview = view;
             Graphics.DrawMeshNow(snowBatch, model);
+        }
+
+        // ---- dust motes drifting in the lamp light ----------------------------------------------------
+
+        struct Mote { public System.Numerics.Vector3 P, V; public int Src; public float Size, Phase; }
+        Mote[] motes;
+        Mesh moteBatch;
+        Vector3[] moteV;
+        Color[] moteC;
+        const int MotesPerSource = 70;
+
+        void UpdateMotes(float dt, Vector3 rightU, Vector3 upU)
+        {
+            int nSrc = room.MoteSources.Count;
+            if (nSrc == 0) return;
+            int n = nSrc * MotesPerSource;
+            if (motes == null || motes.Length != n)
+            {
+                motes = new Mote[n];
+                for (int i = 0; i < n; i++)
+                {
+                    motes[i].Src = i / MotesPerSource;
+                    var (sp, sr) = room.MoteSources[motes[i].Src];
+                    motes[i].P = N3(sp) + RandomInBall(sr);
+                    motes[i].Size = Rnd(0.0025f, 0.0055f);
+                    motes[i].Phase = Rnd(0f, 6.28f);
+                }
+                if (moteBatch == null)
+                {
+                    moteBatch = new Mesh { name = "OlliVR_Motes", hideFlags = HideFlags.HideAndDontSave };
+                    moteBatch.MarkDynamic();
+                    Object.DontDestroyOnLoad(moteBatch);
+                }
+                moteBatch.Clear();
+                moteV = new Vector3[n * 4];
+                moteC = new Color[n * 4];
+                var uv = new Vector2[n * 4];
+                var tri = new int[n * 6];
+                for (int i = 0; i < n; i++)
+                {
+                    uv[i * 4] = new Vector2(0, 0); uv[i * 4 + 1] = new Vector2(0, 1); uv[i * 4 + 2] = new Vector2(1, 1); uv[i * 4 + 3] = new Vector2(1, 0);
+                    tri[i * 6] = i * 4; tri[i * 6 + 1] = i * 4 + 1; tri[i * 6 + 2] = i * 4 + 2;
+                    tri[i * 6 + 3] = i * 4; tri[i * 6 + 4] = i * 4 + 2; tri[i * 6 + 5] = i * 4 + 3;
+                }
+                moteBatch.vertices = moteV; moteBatch.uv = uv; moteBatch.colors = moteC; moteBatch.triangles = tri;
+                moteBatch.bounds = new Bounds(Vector3.zero, Vector3.one * 1000f);
+            }
+            float t = Time.unscaledTime;
+            var right = N3(rightU); var up = N3(upU);
+            for (int i = 0; i < n; i++)
+            {
+                ref var m = ref motes[i];
+                var (spU, sr) = room.MoteSources[m.Src];
+                var sp = N3(spU);
+                // Slow Brownian drift with a gentle warm updraft, kept inside the lit cloud.
+                m.V += new System.Numerics.Vector3(Rnd(-1f, 1f), Rnd(-0.8f, 1.2f), Rnd(-1f, 1f)) * (0.01f * dt * 60f * 0.016f);
+                m.V *= 0.985f;
+                m.P += m.V * dt * 8f;
+                var d = m.P - sp;
+                float dist = d.Length();
+                if (dist > sr) { m.P = sp + RandomInBall(sr * 0.6f); m.V = default; dist = (m.P - sp).Length(); }
+                float lit = 1f - dist / sr; lit *= lit;
+                float glint = 0.55f + 0.45f * System.MathF.Sin(t * 2.1f + m.Phase);
+                var c = new Color(1f, 0.82f, 0.55f) * (lit * glint * 0.9f); c.a = 1f;
+                var r = right * m.Size; var u = up * m.Size;
+                var a0 = m.P - r - u; var a1 = m.P - r + u; var a2 = m.P + r + u; var a3 = m.P + r - u;
+                moteV[i * 4] = new Vector3(a0.X, a0.Y, a0.Z); moteV[i * 4 + 1] = new Vector3(a1.X, a1.Y, a1.Z);
+                moteV[i * 4 + 2] = new Vector3(a2.X, a2.Y, a2.Z); moteV[i * 4 + 3] = new Vector3(a3.X, a3.Y, a3.Z);
+                moteC[i * 4] = c; moteC[i * 4 + 1] = c; moteC[i * 4 + 2] = c; moteC[i * 4 + 3] = c;
+            }
+            moteBatch.vertices = moteV;
+            moteBatch.colors = moteC;
+        }
+
+        System.Numerics.Vector3 RandomInBall(float r)
+        {
+            while (true)
+            {
+                var v = new System.Numerics.Vector3(Rnd(-1f, 1f), Rnd(-1f, 1f), Rnd(-1f, 1f));
+                if (v.LengthSquared() <= 1f) return v * r;
+            }
+        }
+
+        void DrawMotes(Matrix4x4 view, Matrix4x4 model)
+        {
+            if (moteBatch == null || motes == null) return;
+            var m = glowAdditive ? glowMat : addMat;
+            m.mainTexture = RoomTextures.Halo;
+            m.SetPass(m == glowMat ? glowPass : 0);
+            GL.modelview = view;
+            Graphics.DrawMeshNow(moteBatch, model);
         }
 
         void DrawSnow()

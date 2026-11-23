@@ -20,13 +20,36 @@ namespace OlliVR
 
         public readonly ConfigEntry<float> AmbientGlow;
         public readonly ConfigEntry<float> FloorReflection;
+        public readonly ConfigEntry<bool> LitShader;
 
         public readonly ConfigEntry<bool> FlipVertical;
         public readonly ConfigEntry<bool> ReplaceTAA;
         public readonly ConfigEntry<string> DisabledEffects;
 
+        readonly ConfigFile file;
+        System.DateTime fileTime;
+        float nextCheck;
+
+        /// <summary>Reloads the config when the file changes on disk (lets settings be tried while playing).</summary>
+        public void ReloadIfChanged()
+        {
+            if (UnityEngine.Time.unscaledTime < nextCheck) return;
+            nextCheck = UnityEngine.Time.unscaledTime + 1f;
+            try
+            {
+                var t = System.IO.File.GetLastWriteTimeUtc(file.ConfigFilePath);
+                if (fileTime == default) { fileTime = t; return; }
+                if (t == fileTime) return;
+                fileTime = t;
+                file.Reload();
+                Plugin.L.LogInfo("Config reloaded from disk.");
+            }
+            catch (System.Exception e) { Plugin.L.LogWarning("Config reload failed: " + e.Message); }
+        }
+
         public VRConfig(ConfigFile f)
         {
+            file = f;
             Enabled = f.Bind("General", "Enabled", true, "Enable the VR mod.");
             UncapFramerate = f.Bind("General", "UncapFramerate", true,
                 "Disable the game's vsync / frame cap so SteamVR paces frames at the headset refresh rate.");
@@ -62,6 +85,8 @@ namespace OlliVR
                 "Brightness of the light the screen's edge colours cast on the wall and floor around it. 0 = dark room.");
             FloorReflection = f.Bind("Environment", "FloorReflection", 0.2f,
                 "How glossy the varnished floor is: strength of the room's (and the TV's) reflection in it, 0 to 1. 0 = matte.");
+            LitShader = f.Bind("Environment", "LitShader", true,
+                "Per-pixel lighting for the room (normal-mapped surfaces and highlights from the lamps and fire). Off = baked lighting only.");
 
             FlipVertical = f.Bind("Rendering", "FlipVertical", true,
                 "Flip images vertically on submit. Toggle if the screen is upside down.");

@@ -47,6 +47,7 @@ namespace OlliVR
         // Vertices in, colours out.
         public V3[] P, N, Tint;
         public bool[] Emissive, NoAo;
+        public float[] Gloss;   // per vertex: strength of a baked highlight towards the seated viewer (origin)
         public V3[] Base, FireOnly, TvOnly;
 
         // The TV screen as an area light facing -z (its colour is applied live, per frame; this bakes only how
@@ -107,6 +108,14 @@ namespace OlliVR
                 if (vis <= 0f) continue;
                 vis *= Visibility(origin, l.Samples, occ);
                 var c = l.Col * (ndl * att * shape * vis);
+                if (Gloss != null && Gloss[i] > 0f && l.Kind != Kind.Fire)
+                {
+                    // Blinn-Phong towards the viewer's usual seat: a sheen on leather that sits right from there.
+                    var view = V3.Normalize(-p);
+                    var hv = V3.Normalize(dir + view);
+                    float spec = MathF.Pow(MathF.Max(0f, V3.Dot(nrm, hv)), 28f) * Gloss[i];
+                    c += l.Col * (att * shape * vis * spec);
+                }
                 if (l.Kind == Kind.Fire) fire += c; else light += c;
             }
 
@@ -284,6 +293,37 @@ namespace OlliVR
             if (ta > t0) t0 = ta;
             if (tb < t1) t1 = tb;
             return t0 <= t1;
+        }
+
+        /// <summary>Diagnostics: pairs of solid boxes that interpenetrate by more than 'margin' (separating axis test).</summary>
+        public static List<(Obb a, Obb b, float depth)> FindOverlaps(IReadOnlyList<Obb> boxes, float margin)
+        {
+            var result = new List<(Obb, Obb, float)>();
+            for (int i = 0; i < boxes.Count; i++)
+                for (int j = i + 1; j < boxes.Count; j++)
+                {
+                    var a = boxes[i]; var b = boxes[j];
+                    if (V3.Distance(a.C, b.C) > a.R + b.R) continue;
+                    var axes = new List<V3> { a.X, a.Y, a.Z, b.X, b.Y, b.Z };
+                    foreach (var u in new[] { a.X, a.Y, a.Z })
+                        foreach (var v in new[] { b.X, b.Y, b.Z })
+                        {
+                            var c = V3.Cross(u, v);
+                            if (c.LengthSquared() > 1e-6f) axes.Add(V3.Normalize(c));
+                        }
+                    float minPen = float.MaxValue;
+                    var d = b.C - a.C;
+                    foreach (var ax in axes)
+                    {
+                        float ra = MathF.Abs(V3.Dot(a.X, ax)) * a.H.X + MathF.Abs(V3.Dot(a.Y, ax)) * a.H.Y + MathF.Abs(V3.Dot(a.Z, ax)) * a.H.Z;
+                        float rb = MathF.Abs(V3.Dot(b.X, ax)) * b.H.X + MathF.Abs(V3.Dot(b.Y, ax)) * b.H.Y + MathF.Abs(V3.Dot(b.Z, ax)) * b.H.Z;
+                        float pen = ra + rb - MathF.Abs(V3.Dot(d, ax));
+                        if (pen < minPen) minPen = pen;
+                        if (minPen <= margin) break;
+                    }
+                    if (minPen > margin) result.Add((a, b, minPen));
+                }
+            return result;
         }
 
         public static Obb MakeObb(V3 c, V3 x, V3 y, V3 z, V3 half)
