@@ -7,9 +7,7 @@ A BepInEx 6 (IL2CPP) mod that puts **OlliOlli World** on a big stereoscopic 3D v
 ## Features
 - **Real 3D depth.** Rails, ramps and scenery pop out of the screen or sit behind it, so you can judge gaps and landings by depth.
 - **Look into the world.** Lean or move your head and the view shifts, as if the screen were a window into the game.
-- **Plays like the original.** Same side-on view, same framing with room to see what's coming, same controls on your gamepad.
 - **Steady depth.** Your skater always sits on the screen surface, so the 3D stays comfortable at speed.
-- **The whole game works.** Menus, the world map, the HUD and dialogue all show up in VR.
 - **A big screen in front of you.** Recenter any time with L3 + R3. Size, distance and depth strength are adjustable.
 
 <p align="center"><img src="docs/side-by-side.jpg" alt="Side-by-side stereo image as sent to the headset"><br><sub>The side-by-side image the headset receives (left eye, right eye).</sub></p>
